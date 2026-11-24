@@ -1277,9 +1277,8 @@ async function extractTimelineKeyframes(file, duration, desiredFrameCount = 12) 
 }
 
 /**
- * Draws a single frame in the exact "Atmospheric Cinematic" 9:16 composition:
- * - Full-bleed blurred background (adjustable via Efek Blur 0%..200%)
- * - Dark teal / blue-green cinematic gradient in the lower area + soft light bloom
+ * Draws a single frame in the 9:16 composition:
+ * - Full-bleed blurred background across the entire 9:16 canvas (adjustable via Efek Blur 0%..200%)
  * - Unblurred foreground OVERLAY whose actual bounding box (overlayW × overlayH)
  *   grows larger or shrinks with Zoom (30%..320%) and moves with Sumbu X / Sumbu Y.
  */
@@ -1313,7 +1312,7 @@ function drawAtmosphericCinematicFrame(
   const zoomFactor = Math.max(0.3, Math.min(3.5, zoomPct / 100));
   const blurPx = Math.max(0, Math.round(34 * (blurPct / 100)));
 
-  // 1. Background layer: enlarged cover scale with adjustable atmospheric blur
+  // 1. Background layer: enlarged cover scale with adjustable atmospheric blur across full 9:16 canvas
   ctx.save();
   const coverScale = Math.max(W / vw, H / vh) * 1.24;
   const bgW = vw * coverScale;
@@ -1349,40 +1348,7 @@ function drawAtmosphericCinematicFrame(
   const overlayX = Math.round((W - overlayW) / 2 + panX);
   const overlayY = Math.round((H - overlayH) / 2 + panY);
 
-  // 3. Top subtle atmospheric veil
-  const topEnd = Math.max(0, Math.min(H, overlayY));
-  if (topEnd > 0) {
-    const topGrad = ctx.createLinearGradient(0, 0, 0, topEnd);
-    topGrad.addColorStop(0, 'rgba(12, 24, 36, 0.2)');
-    topGrad.addColorStop(1, 'rgba(12, 24, 36, 0.03)');
-    ctx.fillStyle = topGrad;
-    ctx.fillRect(0, 0, W, topEnd);
-  }
-
-  // 4. Bottom signature dark-teal / blue-green cinematic gradient
-  const bottomStart = Math.max(0, Math.min(H * 0.72, overlayY + overlayH - 2));
-  const bottomGrad = ctx.createLinearGradient(0, bottomStart, 0, H);
-  bottomGrad.addColorStop(0, 'rgba(13, 66, 76, 0.78)');
-  bottomGrad.addColorStop(0.45, 'rgba(7, 46, 56, 0.89)');
-  bottomGrad.addColorStop(1, 'rgba(3, 22, 29, 0.96)');
-  ctx.fillStyle = bottomGrad;
-  ctx.fillRect(0, bottomStart, W, H - bottomStart);
-
-  // Subtle soft teal light bloom in the lower atmospheric field
-  const glow = ctx.createRadialGradient(
-    W * 0.5,
-    bottomStart + (H - bottomStart) * 0.38,
-    W * 0.05,
-    W * 0.5,
-    bottomStart + (H - bottomStart) * 0.38,
-    W * 0.65
-  );
-  glow.addColorStop(0, 'rgba(20, 148, 162, 0.16)');
-  glow.addColorStop(1, 'rgba(4, 28, 36, 0)');
-  ctx.fillStyle = glow;
-  ctx.fillRect(0, bottomStart, W, H - bottomStart);
-
-  // 5. Sharp, unblurred foreground OVERLAY (expands & shrinks cleanly with Zoom + Sumbu X / Sumbu Y)
+  // 3. Sharp, unblurred foreground OVERLAY (expands & shrinks cleanly with Zoom + Sumbu X / Sumbu Y)
   if (mediaSource) {
     ctx.save();
     ctx.filter = 'contrast(1.04) saturate(1.05) brightness(1.01)';
@@ -1390,21 +1356,7 @@ function drawAtmosphericCinematicFrame(
     ctx.restore();
   }
 
-  // 6. Soft cinematic seam feathering at top & bottom boundaries of the unblurred overlay
-  const seamHeight = Math.max(5, Math.round(H * 0.007));
-  const topSeam = ctx.createLinearGradient(0, overlayY, 0, overlayY + seamHeight);
-  topSeam.addColorStop(0, 'rgba(15, 35, 45, 0.25)');
-  topSeam.addColorStop(1, 'rgba(15, 35, 45, 0)');
-  ctx.fillStyle = topSeam;
-  ctx.fillRect(overlayX, overlayY, overlayW, seamHeight);
-
-  const botSeam = ctx.createLinearGradient(0, overlayY + overlayH - seamHeight, 0, overlayY + overlayH);
-  botSeam.addColorStop(0, 'rgba(8, 45, 54, 0)');
-  botSeam.addColorStop(1, 'rgba(8, 45, 54, 0.35)');
-  ctx.fillStyle = botSeam;
-  ctx.fillRect(overlayX, overlayY + overlayH - seamHeight, overlayW, seamHeight);
-
-  // 7. Interactive overlay bounding guide (shown only in the live style preview editor)
+  // 4. Interactive overlay bounding guide (shown only in the live style preview editor)
   if (showOverlayGuide) {
     ctx.save();
     const gx = Math.max(1, overlayX);
