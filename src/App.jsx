@@ -1,4 +1,3 @@
-```react
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
   Film,
@@ -5290,4 +5289,3 @@ export default function App() {
     </StudioErrorBoundary>
   );
 }
-```
