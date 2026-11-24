@@ -21,16 +21,12 @@ import {
   Trash2,
   History,
   Settings,
-  ChevronRight,
-  ChevronDown,
   Eye,
   EyeOff,
   Clock,
-  Award,
   ShieldCheck,
   ShieldAlert,
   Search,
-  ArrowUpDown,
   FolderOpen,
   HardDrive,
   Info,
@@ -38,9 +34,6 @@ import {
   Edit3,
   Save,
   X,
-  Layers,
-  Volume2,
-  VolumeX,
   RotateCcw,
   AlertCircle,
   CheckSquare
@@ -91,20 +84,6 @@ const QUANTITIES = [
   { value: 'max', label: 'Maximum available clips' }
 ];
 
-const INDONESIAN_POWER_WORDS = [
-  'Ternyata',
-  'Rahasia',
-  'Terbukti',
-  'Gila',
-  'Berbeda',
-  'Kesalahan',
-  'Mengejutkan',
-  'Jangan',
-  'Faktanya',
-  'Unik',
-  'Fatal'
-];
-
 const PIPELINE_STEPS = [
   { id: 1, key: 'validating', title: 'Validating Video', desc: 'Verifying source stream, dimensions, and timeline integrity' },
   { id: 2, key: 'brief', title: 'Reading Campaign Brief', desc: 'Extracting campaign objectives, rules, tone, and restrictions' },
@@ -148,11 +127,13 @@ function formatBytes(bytes) {
 }
 
 function sanitizeFilename(name) {
-  return (name || 'clip')
-    .replace(/[^a-zA-Z0-9_\-\s]/g, '')
-    .trim()
-    .replace(/\s+/g, '_')
-    .slice(0, 60) || 'viral_clip';
+  return (
+    (name || 'clip')
+      .replace(/[^a-zA-Z0-9_\-\s]/g, '')
+      .trim()
+      .replace(/\s+/g, '_')
+      .slice(0, 60) || 'viral_clip'
+  );
 }
 
 function generateId(prefix = 'id') {
@@ -314,7 +295,7 @@ async function extractDocxText(arrayBuffer) {
 }
 
 async function parseCampaignBriefFile(file) {
-  const MAX_SIZE = 15 * 1024 * 1024; // 15MB
+  const MAX_SIZE = 15 * 1024 * 1024;
   if (file.size > MAX_SIZE) {
     throw new Error('Campaign brief file exceeds the 15MB size limit.');
   }
@@ -366,7 +347,7 @@ async function parseCampaignBriefFile(file) {
 
 /**
  * ============================================================================
- * PERSISTENT DATABASE LAYER (INDEXEDDB + IN-MEMORY BLOB CACHE FOR 100% PLAYBACK)
+ * PERSISTENT DATABASE LAYER (INDEXEDDB + IN-MEMORY BLOB CACHE)
  * ============================================================================
  */
 
@@ -402,7 +383,6 @@ function openStudioDB() {
 
 const StudioDB = {
   async saveProjectWithClips(project, clips, clipBlobsMap = {}) {
-    // Cache blobs in memory immediately for instant playback & download
     const serializedRecords = [];
     for (const clip of clips) {
       const blob = clipBlobsMap[clip.id];
@@ -418,7 +398,7 @@ const StudioDB = {
             mimeType: blob.type || 'video/webm'
           });
         } catch {
-          // Keep in memory cache even if ArrayBuffer conversion is restricted
+          // Keep in memory cache if ArrayBuffer serialization is restricted
         }
       }
     }
@@ -1091,7 +1071,6 @@ function validateAndRankMoments(rawMoments, videoDuration, targetDuration, reque
     }
     if (end - start < 3) continue;
 
-    // Check overlap with already accepted moments
     const hasHeavyOverlap = cleaned.some((existing) => {
       const overlapStart = Math.max(existing.startTime, start);
       const overlapEnd = Math.min(existing.endTime, end);
@@ -1130,7 +1109,7 @@ function validateAndRankMoments(rawMoments, videoDuration, targetDuration, reque
         ? m.hookOptions
         : [
             {
-              text: `Ternyata bagian ini menyimpan detail yang jarang diperhatikan orang!`,
+              text: 'Ternyata bagian ini menyimpan detail yang jarang diperhatikan orang!',
               angle: 'Curiosity & Surprise',
               powerWord: 'Ternyata'
             }
@@ -1298,8 +1277,8 @@ async function extractTimelineKeyframes(file, duration, desiredFrameCount = 12) 
 
 /**
  * Draws a single frame in the exact "Atmospheric Cinematic" 9:16 composition
- * matching the uploaded visual reference (1000340799_2.png) with user-adjustable
- * Sumbu X (offsetX %), Sumbu Y (offsetY %), Zoom (zoom %), and Efek Blur (blur %).
+ * with user-adjustable Sumbu X (offsetX %), Sumbu Y (offsetY %), Zoom (zoom %),
+ * and Efek Blur (blur %).
  */
 function drawAtmosphericCinematicFrame(ctx, sourceVideo, W, H, transform = DEFAULT_EDIT_TRANSFORM) {
   const vw = sourceVideo.videoWidth || sourceVideo.width || 1280;
@@ -1357,7 +1336,7 @@ function drawAtmosphericCinematicFrame(ctx, sourceVideo, W, H, transform = DEFAU
     ctx.fillRect(0, 0, W, slotY);
   }
 
-  // 4. Bottom signature dark-teal / blue-green cinematic gradient (matching reference image)
+  // 4. Bottom signature dark-teal / blue-green cinematic gradient
   const bottomStart = Math.max(0, slotY + baseH - 2);
   const bottomGrad = ctx.createLinearGradient(0, bottomStart, 0, H);
   bottomGrad.addColorStop(0, 'rgba(13, 66, 76, 0.78)');
@@ -1405,7 +1384,7 @@ function drawAtmosphericCinematicFrame(ctx, sourceVideo, W, H, transform = DEFAU
 }
 
 /**
- * Generates an offscreen 16:9 reference scenic canvas (matching Image 2: clouds + alpine mountains)
+ * Generates an offscreen 16:9 reference scenic canvas (clouds + alpine mountains)
  * so the live style preview works immediately even before a user uploads a video.
  */
 function renderReferenceLandscapeCanvas(offscreenCanvas, timeSec = 0) {
@@ -1413,7 +1392,6 @@ function renderReferenceLandscapeCanvas(offscreenCanvas, timeSec = 0) {
   const H = offscreenCanvas.height;
   const ctx = offscreenCanvas.getContext('2d');
 
-  // Crisp alpine sky
   const sky = ctx.createLinearGradient(0, 0, 0, H * 0.65);
   sky.addColorStop(0, '#1e3a8a');
   sky.addColorStop(0.55, '#60a5fa');
@@ -1421,7 +1399,6 @@ function renderReferenceLandscapeCanvas(offscreenCanvas, timeSec = 0) {
   ctx.fillStyle = sky;
   ctx.fillRect(0, 0, W, H);
 
-  // Soft sunlit clouds
   ctx.fillStyle = 'rgba(255, 255, 255, 0.72)';
   for (let i = 0; i < 6; i++) {
     const cx = ((i * 190 + timeSec * 18) % (W + 220)) - 110;
@@ -1431,7 +1408,6 @@ function renderReferenceLandscapeCanvas(offscreenCanvas, timeSec = 0) {
     ctx.fill();
   }
 
-  // Distant teal-blue mountain ridges
   ctx.fillStyle = '#0f4c5c';
   ctx.beginPath();
   ctx.moveTo(0, H);
@@ -1444,7 +1420,6 @@ function renderReferenceLandscapeCanvas(offscreenCanvas, timeSec = 0) {
   ctx.closePath();
   ctx.fill();
 
-  // Foreground deep emerald-teal peaks
   ctx.fillStyle = '#062c36';
   ctx.beginPath();
   ctx.moveTo(0, H);
@@ -1485,7 +1460,6 @@ async function renderAtmosphericCinematicClip({
   const safeStart = Math.max(0, Math.min(startTime, Math.max(0, video.duration - 1)));
   const safeEnd = Math.max(safeStart + 1, Math.min(endTime, video.duration));
 
-  // Seek to clip start
   await new Promise((resolve) => {
     let settled = false;
     const done = () => {
@@ -1504,11 +1478,9 @@ async function renderAtmosphericCinematicClip({
   canvas.height = H;
   const ctx = canvas.getContext('2d');
 
-  // Render initial frame & capture high-res JPEG thumbnail
   drawAtmosphericCinematicFrame(ctx, video, W, H, transform);
   const thumbnailDataUrl = canvas.toDataURL('image/jpeg', 0.86);
 
-  // Create a single smooth 30fps video stream from canvas
   const canvasStream = canvas.captureStream(30);
   let combinedStream = canvasStream;
   let audioCtx = null;
@@ -1558,7 +1530,6 @@ async function renderAtmosphericCinematicClip({
   };
 
   const clipSpan = Math.max(1, safeEnd - safeStart);
-  // Use smooth 1.0x or 1.5x playback to guarantee butter-smooth frames without drops
   video.playbackRate = speedMode === 'fast' ? 1.5 : 1.0;
 
   return new Promise((resolve, reject) => {
@@ -1590,7 +1561,11 @@ async function renderAtmosphericCinematicClip({
       const blob = new Blob(chunks, { type: mime });
       cleanup();
       if (!blob || blob.size === 0) {
-        reject(new Error('Rendered video buffer was empty. Please try switching Render Encoding Speed to 1x Realtime in Settings.'));
+        reject(
+          new Error(
+            'Rendered video buffer was empty. Please try switching Render Encoding Speed to 1x Realtime in Settings.'
+          )
+        );
         return;
       }
       resolve({
@@ -1608,7 +1583,6 @@ async function renderAtmosphericCinematicClip({
       reject(new Error(err?.error?.message || 'Video encoding error during clip render.'));
     };
 
-    // High-precision 30fps pump that stays smooth and reliable
     const pumpFrame = () => {
       if (finished) return;
       drawAtmosphericCinematicFrame(ctx, video, W, H, transform);
@@ -1695,14 +1669,12 @@ async function generateBuiltInSampleVideo(onProgress) {
 
       const scene = scenes.find((s) => elapsed >= s.start && elapsed < s.end) || scenes[0];
 
-      // Sky gradient
       const sky = ctx.createLinearGradient(0, 0, 0, H * 0.68);
       sky.addColorStop(0, scene.skyTop);
       sky.addColorStop(1, scene.skyBot);
       ctx.fillStyle = sky;
       ctx.fillRect(0, 0, W, H);
 
-      // Moving clouds
       ctx.fillStyle = 'rgba(255,255,255,0.45)';
       for (let i = 0; i < 5; i++) {
         const cx = ((i * 230 + elapsed * 28) % (W + 200)) - 100;
@@ -1712,7 +1684,6 @@ async function generateBuiltInSampleVideo(onProgress) {
         ctx.fill();
       }
 
-      // Mountain ridge silhouette
       ctx.fillStyle = scene.mountain;
       ctx.beginPath();
       ctx.moveTo(0, H);
@@ -1725,7 +1696,6 @@ async function generateBuiltInSampleVideo(onProgress) {
       ctx.closePath();
       ctx.fill();
 
-      // Cinematic lower overlay card
       ctx.fillStyle = 'rgba(6, 24, 32, 0.76)';
       ctx.fillRect(42, H - 145, W - 84, 102);
       ctx.strokeStyle = 'rgba(56, 189, 248, 0.55)';
@@ -1867,8 +1837,7 @@ function ScoreMetricBar({ label, score, accent = 'cyan' }) {
 }
 
 /**
- * Precision Ruler Tick-Mark Slider matching the uploaded reference UI (1000340825.png)
- * Supports smooth mouse & touch dragging on mobile and desktop.
+ * Precision Ruler Tick-Mark Slider matching the uploaded reference UI
  */
 function PrecisionTickSlider({ label, value, min, max, step = 1, unit = '%', onChange }) {
   const trackRef = useRef(null);
@@ -1936,11 +1905,9 @@ function PrecisionTickSlider({ label, value, min, max, step = 1, unit = '%', onC
         }}
         className="relative flex-1 h-9 rounded-lg bg-[#161920] border border-slate-800/90 overflow-hidden cursor-ew-resize flex items-center px-2 touch-none"
       >
-        {/* Subtle edge vignette matching reference image */}
         <div className="pointer-events-none absolute inset-y-0 left-0 w-6 bg-gradient-to-r from-[#161920] to-transparent z-10" />
         <div className="pointer-events-none absolute inset-y-0 right-0 w-6 bg-gradient-to-l from-[#161920] to-transparent z-10" />
 
-        {/* Ruler vertical tick marks */}
         <div className="w-full flex items-center justify-between">
           {Array.from({ length: tickCount }).map((_, idx) => {
             const isMajor = idx % 5 === 0;
@@ -1960,7 +1927,6 @@ function PrecisionTickSlider({ label, value, min, max, step = 1, unit = '%', onC
           })}
         </div>
 
-        {/* Active Cyan Position Indicator Bar */}
         <div
           className="pointer-events-none absolute top-1.5 bottom-1.5 w-[2.5px] bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.85)] rounded-full z-20 transition-[left] duration-75"
           style={{ left: `calc(${ratio * 100}% - 1px)` }}
@@ -1976,8 +1942,7 @@ function PrecisionTickSlider({ label, value, min, max, step = 1, unit = '%', onC
 }
 
 /**
- * Live 9:16 Style & Framing Preview Canvas placed right above the Sumbu X, Sumbu Y,
- * Zoom, and Efek Blur sliders so creators can preview their composition in real time.
+ * Live 9:16 Style & Framing Preview Canvas + Precision Tick Sliders
  */
 function LiveStylePreviewEditor({ videoFile, transform, onChangeTransform }) {
   const previewCanvasRef = useRef(null);
@@ -2000,7 +1965,7 @@ function LiveStylePreviewEditor({ videoFile, transform, onChangeTransform }) {
 
   useEffect(() => {
     let rafId = null;
-    let startWall = performance.now();
+    const startWall = performance.now();
 
     if (!fallbackCanvasRef.current) {
       const c = document.createElement('canvas');
@@ -2070,7 +2035,6 @@ function LiveStylePreviewEditor({ videoFile, transform, onChangeTransform }) {
         )}
       </div>
 
-      {/* Hidden source video element driving the live canvas */}
       {videoObjectUrl && (
         <video
           ref={hiddenVideoRef}
@@ -2087,11 +2051,9 @@ function LiveStylePreviewEditor({ videoFile, transform, onChangeTransform }) {
         />
       )}
 
-      {/* 9:16 Live Preview Frame */}
       <div className="relative mx-auto w-full max-w-[210px] aspect-[9/16] rounded-xl overflow-hidden border border-cyan-500/35 shadow-2xl bg-[#051820] group">
         <canvas ref={previewCanvasRef} width={360} height={640} className="w-full h-full object-contain block" />
 
-        {/* Play/Pause Overlay Button */}
         <button
           type="button"
           onClick={togglePreviewPlay}
@@ -2113,7 +2075,6 @@ function LiveStylePreviewEditor({ videoFile, transform, onChangeTransform }) {
         </div>
       </div>
 
-      {/* Timeline Scrubber when a real video is loaded */}
       {videoObjectUrl && (
         <div className="flex items-center gap-2 px-1">
           <button
@@ -2142,7 +2103,6 @@ function LiveStylePreviewEditor({ videoFile, transform, onChangeTransform }) {
         </div>
       )}
 
-      {/* Precision Tick-Mark Controls: Sumbu X, Sumbu Y, Zoom, Efek Blur */}
       <div className="pt-2 border-t border-slate-800/80 space-y-1">
         <PrecisionTickSlider
           label="Sumbu x"
@@ -2205,7 +2165,6 @@ function ClipResultCard({
 }) {
   const [videoUrl, setVideoUrl] = useState(null);
   const [videoBlobSize, setVideoBlobSize] = useState(0);
-  const [isPlaying, setIsPlaying] = useState(false);
   const [showPreviewModal, setShowPreviewModal] = useState(false);
   const [showTransformEditor, setShowTransformEditor] = useState(false);
   const [clipTransform, setClipTransform] = useState(clip.transform || { ...DEFAULT_EDIT_TRANSFORM });
@@ -2234,17 +2193,6 @@ function ClipResultCard({
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [clip.id, clip.renderedVersion]);
-
-  const togglePlay = () => {
-    const v = videoRef.current;
-    if (!v) return;
-    if (v.paused) {
-      v.play().then(() => setIsPlaying(true)).catch(() => {});
-    } else {
-      v.pause();
-      setIsPlaying(false);
-    }
-  };
 
   const handleDownloadClip = async () => {
     try {
@@ -2302,29 +2250,6 @@ function ClipResultCard({
       onNotify(err.message || 'Failed to re-render clip.', 'error');
     } finally {
       setRerenderingClip(false);
-    }
-  };
-
-  const handleDownloadClip = async () => {
-    try {
-      const blob = await StudioDB.getClipBlob(clip.id);
-      if (!blob) {
-        onNotify('No rendered video file is stored for this clip (created in metadata-only mode).', 'error');
-        return;
-      }
-      const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
-      const filename = `Rank${rank}_${sanitizeFilename(clip.title)}_${clip.resolution}.${ext}`;
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 2000);
-      onNotify(`Downloading ${filename}`, 'success');
-    } catch {
-      onNotify('Failed to export video clip.', 'error');
     }
   };
 
@@ -2521,19 +2446,15 @@ function ClipResultCard({
             {/* 9:16 Vertical Video Frame */}
             <div className="relative mx-auto w-full max-w-[250px] aspect-[9/16] rounded-xl overflow-hidden bg-[#06181f] border border-slate-700/80 shadow-2xl group">
               {videoUrl ? (
-                <>
-                  <video
-                    ref={videoRef}
-                    src={videoUrl}
-                    poster={clip.thumbnailDataUrl || undefined}
-                    playsInline
-                    controls
-                    preload="metadata"
-                    onPlay={() => setIsPlaying(true)}
-                    onPause={() => setIsPlaying(false)}
-                    className="w-full h-full object-contain bg-black"
-                  />
-                </>
+                <video
+                  ref={videoRef}
+                  src={videoUrl}
+                  poster={clip.thumbnailDataUrl || undefined}
+                  playsInline
+                  controls
+                  preload="metadata"
+                  className="w-full h-full object-contain bg-black"
+                />
               ) : clip.thumbnailDataUrl ? (
                 <img src={clip.thumbnailDataUrl} alt={clip.title} className="w-full h-full object-cover" />
               ) : (
@@ -2647,7 +2568,7 @@ function ClipResultCard({
             </div>
           </div>
 
-          {/* Fullscreen-Style Pre-Download Video Preview Modal */}
+          {/* Pre-Download Video Preview Modal */}
           {showPreviewModal && videoUrl && (
             <div
               role="dialog"
@@ -3288,10 +3209,8 @@ function ClipResultCard({
  */
 
 export default function App() {
-  // Navigation State: 'create' | 'processing' | 'results' | 'history' | 'settings'
   const [activePage, setActivePage] = useState('create');
 
-  // Global Toast Notification
   const [toast, setToast] = useState(null);
   const notify = useCallback((message, type = 'info') => {
     setToast({ id: Date.now(), message, type });
@@ -3303,7 +3222,6 @@ export default function App() {
     return () => clearTimeout(t);
   }, [toast]);
 
-  // Persistent Settings State
   const [appSettings, setAppSettings] = useState({
     defaultResolution: '720p',
     defaultDuration: 30,
@@ -3312,7 +3230,6 @@ export default function App() {
     renderSpeedMode: 'fast'
   });
 
-  // Section A: Gemini API Key (Session-scoped only, never stored in clip history)
   const [apiKey, setApiKey] = useState(() => {
     try {
       return sessionStorage.getItem(SESSION_API_KEY_STORAGE) || '';
@@ -3321,13 +3238,12 @@ export default function App() {
     }
   });
   const [showApiKey, setShowApiKey] = useState(false);
-  const [apiStatus, setApiStatus] = useState('idle'); // 'idle' | 'validating' | 'valid' | 'invalid'
+  const [apiStatus, setApiStatus] = useState('idle');
   const [apiStatusMessage, setApiStatusMessage] = useState('');
 
-  // Section B: Video Source (YouTube URL + Authorized Video File)
   const [projectName, setProjectName] = useState('');
   const [youtubeUrl, setYoutubeUrl] = useState('');
-  const [youtubeStatus, setYoutubeStatus] = useState('idle'); // 'idle' | 'verifying' | 'verified' | 'error'
+  const [youtubeStatus, setYoutubeStatus] = useState('idle');
   const [youtubeMeta, setYoutubeMeta] = useState(null);
   const [youtubeError, setYoutubeError] = useState('');
 
@@ -3338,21 +3254,18 @@ export default function App() {
   const [sampleProgress, setSampleProgress] = useState(0);
   const [transcriptNotes, setTranscriptNotes] = useState('');
 
-  // Section C: Campaign Brief
   const [briefFileMeta, setBriefFileMeta] = useState(null);
   const [briefManualText, setBriefManualText] = useState('');
   const [briefRules, setBriefRules] = useState(null);
   const [analyzingBrief, setAnalyzingBrief] = useState(false);
   const [briefError, setBriefError] = useState('');
 
-  // Section D: Editing & Clipping Settings
   const [clippingStyle, setClippingStyle] = useState('atmospheric-cinematic');
   const [editTransform, setEditTransform] = useState({ ...DEFAULT_EDIT_TRANSFORM });
   const [resolution, setResolution] = useState('720p');
   const [targetDuration, setTargetDuration] = useState(30);
   const [clipQuantity, setClipQuantity] = useState(5);
 
-  // Processing Pipeline State
   const [jobState, setJobState] = useState({
     active: false,
     failed: false,
@@ -3370,11 +3283,9 @@ export default function App() {
   const cancelJobRef = useRef(false);
   const pipelineSnapshotRef = useRef(null);
 
-  // Active Project & Clips (Results View)
   const [activeProject, setActiveProject] = useState(null);
   const [activeClips, setActiveClips] = useState([]);
 
-  // Clip History State
   const [historyProjects, setHistoryProjects] = useState([]);
   const [historySearch, setHistorySearch] = useState('');
   const [historySort, setHistorySort] = useState('newest');
@@ -3383,7 +3294,6 @@ export default function App() {
   const [storageStats, setStorageStats] = useState({ projectCount: 0, clipCount: 0, totalBytes: 0 });
   const [confirmClearAll, setConfirmClearAll] = useState(false);
 
-  // Load initial settings and history from IndexedDB
   const refreshHistoryAndStats = useCallback(async () => {
     try {
       const [projects, stats] = await Promise.all([StudioDB.getAllProjects(), StudioDB.getStorageStats()]);
@@ -3402,7 +3312,6 @@ export default function App() {
     refreshHistoryAndStats();
   }, [refreshHistoryAndStats]);
 
-  // Persist API key in sessionStorage only
   const handleApiKeyChange = (val) => {
     setApiKey(val);
     setApiStatus('idle');
@@ -3432,7 +3341,6 @@ export default function App() {
     }
   };
 
-  // Verify YouTube URL via oEmbed
   const handleVerifyYouTube = async () => {
     setYoutubeError('');
     setYoutubeMeta(null);
@@ -3451,11 +3359,10 @@ export default function App() {
     }
   };
 
-  // Handle Authorized Video File Upload
   const handleVideoFileSelect = async (file) => {
     if (!file) return;
     setVideoError('');
-    const maxBytes = 1024 * 1024 * 1024; // 1GB browser memory safeguard
+    const maxBytes = 1024 * 1024 * 1024;
     if (file.size > maxBytes) {
       setVideoError('Video file exceeds 1GB browser processing limit.');
       return;
@@ -3475,7 +3382,6 @@ export default function App() {
     }
   };
 
-  // Load Built-in Sample Video for immediate testing
   const handleLoadBuiltInSample = async () => {
     setGeneratingSample(true);
     setSampleProgress(0);
@@ -3501,7 +3407,6 @@ export default function App() {
     }
   };
 
-  // Handle Campaign Brief File Upload (.pdf, .docx, .txt)
   const handleBriefFileUpload = async (file) => {
     if (!file) return;
     setBriefError('');
@@ -3515,7 +3420,6 @@ export default function App() {
     }
   };
 
-  // Preview & Summarize Brief with Gemini
   const handlePreviewBrief = async () => {
     const combinedText = [briefFileMeta?.textContent || '', briefManualText.trim()].filter(Boolean).join('\n\n');
     if (!combinedText && !briefFileMeta?.pdfBase64) {
@@ -3544,15 +3448,9 @@ export default function App() {
     }
   };
 
-  // Validation Check for "GENERATE VIRAL CLIPS" button
   const hasValidSource = Boolean(videoFile && videoMeta) || youtubeStatus === 'verified';
   const canGenerate = Boolean(apiKey.trim()) && apiStatus !== 'invalid' && hasValidSource && !jobState.active;
 
-  /**
-   * ==========================================================================
-   * 9-STEP BACKGROUND PROCESSING PIPELINE (WITH RETRY & PARTIAL RECOVERY)
-   * ==========================================================================
-   */
   const runGenerationPipeline = async (resumeFromStep = 1) => {
     if (!apiKey.trim()) {
       notify('Please enter your Gemini API key first.', 'error');
@@ -3653,7 +3551,7 @@ export default function App() {
         checkCancelled();
       }
 
-      // STEP 3 — Analyzing Video Content (Keyframe sampling)
+      // STEP 3 — Analyzing Video Content
       if (resumeFromStep <= 3) {
         updateProgress(3, 25, 'Extracting visual keyframes across video timeline...');
         if (videoFile) {
@@ -3740,7 +3638,7 @@ export default function App() {
           checkCancelled();
           const clip = snapshot.rankedClips[i];
           if (snapshot.renderedBlobs[clip.id]) {
-            continue; // Already rendered (preserved on retry!)
+            continue;
           }
 
           const basePct = 62 + Math.round((i / total) * 28);
@@ -3856,13 +3754,11 @@ export default function App() {
     }
   };
 
-  // Update a single clip in state + IndexedDB
   const handleUpdateClip = async (updatedClip) => {
     await StudioDB.updateClip(updatedClip);
     setActiveClips((prev) => prev.map((c) => (c.id === updatedClip.id ? updatedClip : c)));
   };
 
-  // Delete a single clip from state + IndexedDB
   const handleDeleteClip = async (clipId) => {
     await StudioDB.deleteClip(clipId);
     const remaining = activeClips.filter((c) => c.id !== clipId);
@@ -3880,7 +3776,6 @@ export default function App() {
     notify('Clip removed from project.', 'info');
   };
 
-  // Reopen a project from Clip History
   const handleOpenHistoryProject = async (projectId) => {
     try {
       const result = await StudioDB.getProjectById(projectId);
@@ -3896,7 +3791,6 @@ export default function App() {
     }
   };
 
-  // Filtered & Sorted History Projects
   const filteredHistory = useMemo(() => {
     let list = [...historyProjects];
     if (historySearch.trim()) {
@@ -3953,7 +3847,6 @@ export default function App() {
         {/* TOP NAVIGATION HEADER */}
         <header className="sticky top-0 z-40 bg-[#0C0F14]/90 backdrop-blur-md border-b border-slate-800/80">
           <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
-            {/* Brand Identity */}
             <button
               type="button"
               onClick={() => setActivePage('create')}
@@ -3977,7 +3870,6 @@ export default function App() {
               </div>
             </button>
 
-            {/* Primary Navigation Links */}
             <nav aria-label="Main Studio Navigation" className="flex items-center gap-1 overflow-x-auto py-1">
               {navItems.map((item) => {
                 const Icon = item.icon;
@@ -4009,7 +3901,6 @@ export default function App() {
               })}
             </nav>
 
-            {/* Connection Status Pill */}
             <div className="hidden xl:flex items-center gap-2">
               <span
                 className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs border ${
@@ -4040,7 +3931,7 @@ export default function App() {
           <div
             role="status"
             aria-live="polite"
-            className="fixed bottom-5 right-5 z-50 max-w-sm bg-[#161B24] border border-slate-700 shadow-2xl rounded-xl px-4 py-3 flex items-center gap-3 animate-fade-in"
+            className="fixed bottom-5 right-5 z-50 max-w-sm bg-[#161B24] border border-slate-700 shadow-2xl rounded-xl px-4 py-3 flex items-center gap-3"
           >
             {toast.type === 'success' ? (
               <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
@@ -4068,7 +3959,6 @@ export default function App() {
              ================================================================ */}
           {activePage === 'create' && (
             <div className="space-y-6">
-              {/* Page Title & Project Name */}
               <div className="flex flex-col md:flex-row md:items-end justify-between gap-4 pb-2 border-b border-slate-800/80">
                 <div>
                   <h1 className="text-xl sm:text-2xl font-bold text-white tracking-tight">
@@ -4094,7 +3984,7 @@ export default function App() {
               </div>
 
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-                {/* LEFT COLUMN: SECTION A (API KEY) + SECTION B (VIDEO SOURCE) + SECTION C (BRIEF) */}
+                {/* LEFT COLUMN: SECTION A + SECTION B + SECTION C */}
                 <div className="lg:col-span-7 space-y-6">
                   {/* SECTION A — GEMINI API KEY */}
                   <section className="bg-[#11151C] border border-slate-800/90 rounded-2xl p-5 space-y-4">
@@ -4181,7 +4071,7 @@ export default function App() {
                     </div>
                   </section>
 
-                  {/* SECTION B — VIDEO SOURCE (YOUTUBE URL + AUTHORIZED VIDEO FILE) */}
+                  {/* SECTION B — VIDEO SOURCE */}
                   <section className="bg-[#11151C] border border-slate-800/90 rounded-2xl p-5 space-y-5">
                     <div className="flex items-center gap-2.5">
                       <div className="w-8 h-8 rounded-lg bg-cyan-500/15 border border-cyan-500/30 flex items-center justify-center text-cyan-400">
@@ -4195,7 +4085,6 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* YouTube URL Verifier */}
                     <div className="space-y-2">
                       <label htmlFor="youtube-url-input" className="block text-xs font-medium text-slate-300">
                         YouTube Video URL
@@ -4263,7 +4152,6 @@ export default function App() {
                       )}
                     </div>
 
-                    {/* Authorized Video File Upload Zone */}
                     <div className="pt-3 border-t border-slate-800/80 space-y-3">
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <span className="text-xs font-medium text-slate-300">
@@ -4342,7 +4230,6 @@ export default function App() {
                         </p>
                       )}
 
-                      {/* Optional Transcript / Context Notes */}
                       <div>
                         <label htmlFor="transcript-notes" className="block text-xs font-medium text-slate-400 mb-1">
                           Optional Transcript / Key Dialogue Notes (Enhances timestamp accuracy)
@@ -4359,7 +4246,7 @@ export default function App() {
                     </div>
                   </section>
 
-                  {/* SECTION C — CAMPAIGN BRIEF & CLIPPING INSTRUCTIONS */}
+                  {/* SECTION C — CAMPAIGN BRIEF */}
                   <section className="bg-[#11151C] border border-slate-800/90 rounded-2xl p-5 space-y-4">
                     <div className="flex items-center justify-between gap-2">
                       <div className="flex items-center gap-2.5">
@@ -4479,12 +4366,19 @@ export default function App() {
 
                 {/* RIGHT COLUMN: SECTION D — VIDEO EDITING & CLIPPING SETTINGS + GENERATE CTA */}
                 <div className="lg:col-span-5 space-y-6">
-                  <section className="bg-[#11151C] border border-slate-800/90 rounded-2xl p-5 space-y-6 sticky top-22">
+                  <section className="bg-[#11151C] border border-slate-800/90 rounded-2xl p-5 space-y-6 sticky top-20">
                     <div className="flex items-center gap-2.5">
                       <div className="w-8 h-8 rounded-lg bg-cyan-500/15 border border-cyan-500/30 flex items-center justify-center text-cyan-400">
                         <Sliders className="w-4 h-4" />
                       </div>
                       <div>
+                        <h2 className="text-sm font-semibold text-white">Section D — Video Editing & Clipping</h2>
+                        <p className="text-xs text-slate-400">
+                          Configure 9:16 framing, blur, resolution & clip quantity.
+                        </p>
+                      </div>
+                    </div>
+
                     {/* D1. CLIPPING STYLE + LIVE PREVIEW + SUMBU X / Y / ZOOM / BLUR */}
                     <div className="space-y-3">
                       <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400">
@@ -4518,7 +4412,6 @@ export default function App() {
                         );
                       })}
 
-                      {/* Live 9:16 Preview + Precision Tick Sliders (Sumbu X, Sumbu Y, Zoom, Efek Blur) */}
                       <LiveStylePreviewEditor
                         videoFile={videoFile}
                         transform={editTransform}
@@ -4582,7 +4475,10 @@ export default function App() {
 
                     {/* D4. NUMBER OF CLIPS */}
                     <div className="space-y-2">
-                      <label htmlFor="clip-quantity-select" className="block text-xs font-semibold uppercase tracking-wider text-slate-400">
+                      <label
+                        htmlFor="clip-quantity-select"
+                        className="block text-xs font-semibold uppercase tracking-wider text-slate-400"
+                      >
                         D4. Number of Clips to Generate
                       </label>
                       <select
@@ -4836,7 +4732,6 @@ export default function App() {
                 </div>
               ) : (
                 <>
-                  {/* Project Header Banner */}
                   <div className="bg-[#11151C] border border-slate-800 rounded-2xl p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
                     <div className="space-y-1.5">
                       <div className="flex flex-wrap items-center gap-2">
@@ -4882,7 +4777,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Ranked Clip Cards */}
                   <div className="space-y-6">
                     {activeClips.map((clip, index) => (
                       <ClipResultCard
@@ -4926,7 +4820,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Search, Filter & Sort Controls */}
               <div className="grid grid-cols-1 sm:grid-cols-12 gap-3">
                 <div className="sm:col-span-6 relative">
                   <Search className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
@@ -4983,7 +4876,6 @@ export default function App() {
                       className="bg-[#11151C] border border-slate-800 hover:border-slate-700 rounded-2xl overflow-hidden flex flex-col justify-between transition"
                     >
                       <div>
-                        {/* Thumbnail Header */}
                         <div className="relative h-40 bg-[#071e26] overflow-hidden">
                           {proj.thumbnailDataUrl ? (
                             <img
@@ -5111,7 +5003,6 @@ export default function App() {
                 </p>
               </div>
 
-              {/* Default Video & Clipping Output */}
               <div className="bg-[#11151C] border border-slate-800 rounded-2xl p-5 space-y-4">
                 <h2 className="text-sm font-semibold text-white">Video Output & AI Defaults</h2>
 
@@ -5173,7 +5064,7 @@ export default function App() {
                       }
                       className="w-full rounded-lg bg-[#0A0D12] border border-slate-800 px-3 py-2 text-sm text-white"
                     >
-                      <option value="fast">Balanced (2x Realtime)</option>
+                      <option value="fast">Balanced (1.5x Realtime)</option>
                       <option value="realtime">Studio Master (1x Realtime)</option>
                     </select>
                   </div>
@@ -5210,7 +5101,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* API Session & Storage Management */}
               <div className="bg-[#11151C] border border-slate-800 rounded-2xl p-5 space-y-4">
                 <h2 className="text-sm font-semibold text-white">API Security & Persistent Storage</h2>
 
