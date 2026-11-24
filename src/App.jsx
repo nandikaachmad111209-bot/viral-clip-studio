@@ -1,3 +1,4 @@
+```react
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
   Film,
@@ -64,6 +65,13 @@ const CLIPPING_STYLES = {
     description:
       'Vertical 9:16 composition with sharp centered original footage, enlarged soft-blurred top sky extension, and a deep dark-teal cinematic gradient atmosphere below.'
   }
+};
+
+const DEFAULT_EDIT_TRANSFORM = {
+  offsetX: 0, // Sumbu X (-100% to +100%, default 0%)
+  offsetY: 0, // Sumbu Y (-100% to +100%, default 0%)
+  zoom: 100, // Zoom (50% to 250%, default 100%)
+  blur: 100 // Efek Blur (0% to 200%, default 100%)
 };
 
 const RESOLUTIONS = {
@@ -359,12 +367,13 @@ async function parseCampaignBriefFile(file) {
 
 /**
  * ============================================================================
- * PERSISTENT DATABASE LAYER (INDEXEDDB — SURVIVES RELOADS & RESTARTS)
+ * PERSISTENT DATABASE LAYER (INDEXEDDB + IN-MEMORY BLOB CACHE FOR 100% PLAYBACK)
  * ============================================================================
  */
 
 const DB_NAME = 'ViralClipStudioDB_v1';
 const DB_VERSION = 1;
+const MEMORY_BLOB_CACHE = new Map();
 
 function openStudioDB() {
   return new Promise((resolve, reject) => {
@@ -394,6 +403,27 @@ function openStudioDB() {
 
 const StudioDB = {
   async saveProjectWithClips(project, clips, clipBlobsMap = {}) {
+    // Cache blobs in memory immediately for instant playback & download
+    const serializedRecords = [];
+    for (const clip of clips) {
+      const blob = clipBlobsMap[clip.id];
+      if (blob instanceof Blob && blob.size > 0) {
+        MEMORY_BLOB_CACHE.set(clip.id, blob);
+        try {
+          const buffer = await blob.arrayBuffer();
+          serializedRecords.push({
+            id: clip.id,
+            projectId: project.id,
+            buffer,
+            size: blob.size,
+            mimeType: blob.type || 'video/webm'
+          });
+        } catch {
+          // Keep in memory cache even if ArrayBuffer conversion is restricted
+        }
+      }
+    }
+
     const db = await openStudioDB();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(['projects', 'clips', 'blobs'], 'readwrite');
@@ -403,19 +433,32 @@ const StudioDB = {
 
       for (const clip of clips) {
         clipStore.put(clip);
-        if (clipBlobsMap[clip.id]) {
-          blobStore.put({
-            id: clip.id,
-            projectId: project.id,
-            blob: clipBlobsMap[clip.id],
-            size: clipBlobsMap[clip.id].size || 0,
-            mimeType: clipBlobsMap[clip.id].type || 'video/webm'
-          });
-        }
+      }
+      for (const rec of serializedRecords) {
+        blobStore.put(rec);
       }
 
       tx.oncomplete = () => resolve(true);
       tx.onerror = () => reject(tx.error || new Error('Failed to save project to IndexedDB.'));
+    });
+  },
+
+  async saveSingleClipBlob(clipId, projectId, blob) {
+    if (!(blob instanceof Blob) || blob.size === 0) return;
+    MEMORY_BLOB_CACHE.set(clipId, blob);
+    const buffer = await blob.arrayBuffer();
+    const db = await openStudioDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(['blobs'], 'readwrite');
+      tx.objectStore('blobs').put({
+        id: clipId,
+        projectId,
+        buffer,
+        size: blob.size,
+        mimeType: blob.type || 'video/webm'
+      });
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => reject(tx.error);
     });
   },
 
@@ -454,11 +497,33 @@ const StudioDB = {
   },
 
   async getClipBlob(clipId) {
+    if (MEMORY_BLOB_CACHE.has(clipId)) {
+      const cached = MEMORY_BLOB_CACHE.get(clipId);
+      if (cached instanceof Blob && cached.size > 0) return cached;
+    }
     const db = await openStudioDB();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(['blobs'], 'readonly');
       const req = tx.objectStore('blobs').get(clipId);
-      req.onsuccess = () => resolve(req.result?.blob || null);
+      req.onsuccess = () => {
+        const res = req.result;
+        if (!res) {
+          resolve(null);
+          return;
+        }
+        if (res.blob instanceof Blob && res.blob.size > 0) {
+          MEMORY_BLOB_CACHE.set(clipId, res.blob);
+          resolve(res.blob);
+          return;
+        }
+        if (res.buffer) {
+          const reconstructed = new Blob([res.buffer], { type: res.mimeType || 'video/webm' });
+          MEMORY_BLOB_CACHE.set(clipId, reconstructed);
+          resolve(reconstructed);
+          return;
+        }
+        resolve(null);
+      };
       req.onerror = () => reject(req.error);
     });
   },
@@ -484,6 +549,7 @@ const StudioDB = {
   },
 
   async deleteClip(clipId) {
+    MEMORY_BLOB_CACHE.delete(clipId);
     const db = await openStudioDB();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(['clips', 'blobs'], 'readwrite');
@@ -505,6 +571,7 @@ const StudioDB = {
       const req = idx.getAllKeys(projectId);
       req.onsuccess = () => {
         for (const key of req.result || []) {
+          MEMORY_BLOB_CACHE.delete(key);
           clipStore.delete(key);
           blobStore.delete(key);
         }
@@ -574,6 +641,7 @@ const StudioDB = {
   },
 
   async clearAllData() {
+    MEMORY_BLOB_CACHE.clear();
     const db = await openStudioDB();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(['projects', 'clips', 'blobs'], 'readwrite');
@@ -1231,53 +1299,67 @@ async function extractTimelineKeyframes(file, duration, desiredFrameCount = 12) 
 
 /**
  * Draws a single frame in the exact "Atmospheric Cinematic" 9:16 composition
- * matching the uploaded visual reference (1000340799.png):
- * - Top: enlarged, softly blurred upper video imagery
- * - Center: crisp, sharp, uncropped original-aspect-ratio footage
- * - Bottom: enlarged blurred lower imagery + deep dark teal gradient & soft glow
+ * matching the uploaded visual reference (1000340799_2.png) with user-adjustable
+ * Sumbu X (offsetX %), Sumbu Y (offsetY %), Zoom (zoom %), and Efek Blur (blur %).
  */
-function drawAtmosphericCinematicFrame(ctx, sourceVideo, W, H) {
-  const vw = sourceVideo.videoWidth || 1280;
-  const vh = sourceVideo.videoHeight || 720;
+function drawAtmosphericCinematicFrame(ctx, sourceVideo, W, H, transform = DEFAULT_EDIT_TRANSFORM) {
+  const vw = sourceVideo.videoWidth || sourceVideo.width || 1280;
+  const vh = sourceVideo.videoHeight || sourceVideo.height || 720;
   const srcAspect = vw / vh;
 
-  // 1. Background: enlarged cover scale with heavy atmospheric blur
+  const offsetX = Number.isFinite(transform?.offsetX) ? transform.offsetX : 0;
+  const offsetY = Number.isFinite(transform?.offsetY) ? transform.offsetY : 0;
+  const zoomPct = Number.isFinite(transform?.zoom) ? transform.zoom : 100;
+  const blurPct = Number.isFinite(transform?.blur) ? transform.blur : 100;
+
+  const zoomFactor = Math.max(0.5, Math.min(2.5, zoomPct / 100));
+  const blurPx = Math.max(0, Math.round(34 * (blurPct / 100)));
+
+  // 1. Background: enlarged cover scale with adjustable atmospheric blur
   ctx.save();
-  const coverScale = Math.max(W / vw, H / vh) * 1.22;
+  const coverScale = Math.max(W / vw, H / vh) * 1.24;
   const bgW = vw * coverScale;
   const bgH = vh * coverScale;
-  const bgX = (W - bgW) / 2;
-  const bgY = (H - bgH) / 2;
+  const bgX = (W - bgW) / 2 + (offsetX / 100) * (W * 0.15);
+  const bgY = (H - bgH) / 2 + (offsetY / 100) * (H * 0.15);
 
-  ctx.filter = 'blur(34px) saturate(1.1) brightness(0.92)';
+  ctx.fillStyle = '#07222b';
+  ctx.fillRect(0, 0, W, H);
+  ctx.filter = blurPx > 0 ? `blur(${blurPx}px) saturate(1.12) brightness(0.94)` : 'saturate(1.08) brightness(0.94)';
   ctx.drawImage(sourceVideo, bgX, bgY, bgW, bgH);
   ctx.restore();
 
-  // 2. Calculate sharp foreground video rectangle (retaining original aspect ratio)
-  let fgW, fgH;
+  // 2. Calculate base foreground window & apply Zoom + Sumbu X / Sumbu Y framing
+  let baseW, baseH;
   if (srcAspect >= 1.0) {
-    // Landscape / Square: span full width, center vertically
-    fgW = W;
-    fgH = Math.round(W / srcAspect);
+    baseW = W;
+    baseH = Math.round(W / srcAspect);
   } else {
-    // Portrait source: fit cleanly without cropping action
-    fgH = Math.min(H, Math.round(W / srcAspect));
-    fgW = Math.round(fgH * srcAspect);
+    baseH = Math.min(H, Math.round(W / srcAspect));
+    baseW = Math.round(baseH * srcAspect);
   }
-  const fgX = Math.round((W - fgW) / 2);
-  const fgY = Math.round((H - fgH) / 2);
+
+  const slotX = Math.round((W - baseW) / 2);
+  const slotY = Math.round((H - baseH) / 2);
+
+  const zoomedW = baseW * zoomFactor;
+  const zoomedH = baseH * zoomFactor;
+  const panX = (offsetX / 100) * (baseW * 0.5);
+  const panY = (offsetY / 100) * (baseH * 0.5);
+  const drawX = slotX + (baseW - zoomedW) / 2 + panX;
+  const drawY = slotY + (baseH - zoomedH) / 2 + panY;
 
   // 3. Top subtle atmospheric veil for contrast balance
-  if (fgY > 0) {
-    const topGrad = ctx.createLinearGradient(0, 0, 0, fgY);
-    topGrad.addColorStop(0, 'rgba(12, 24, 36, 0.22)');
-    topGrad.addColorStop(1, 'rgba(12, 24, 36, 0.04)');
+  if (slotY > 0) {
+    const topGrad = ctx.createLinearGradient(0, 0, 0, slotY);
+    topGrad.addColorStop(0, 'rgba(12, 24, 36, 0.2)');
+    topGrad.addColorStop(1, 'rgba(12, 24, 36, 0.03)');
     ctx.fillStyle = topGrad;
-    ctx.fillRect(0, 0, W, fgY);
+    ctx.fillRect(0, 0, W, slotY);
   }
 
   // 4. Bottom signature dark-teal / blue-green cinematic gradient (matching reference image)
-  const bottomStart = Math.max(0, fgY + fgH - 4);
+  const bottomStart = Math.max(0, slotY + baseH - 2);
   const bottomGrad = ctx.createLinearGradient(0, bottomStart, 0, H);
   bottomGrad.addColorStop(0, 'rgba(13, 66, 76, 0.78)');
   bottomGrad.addColorStop(0.45, 'rgba(7, 46, 56, 0.89)');
@@ -1299,25 +1381,82 @@ function drawAtmosphericCinematicFrame(ctx, sourceVideo, W, H) {
   ctx.fillStyle = glow;
   ctx.fillRect(0, bottomStart, W, H - bottomStart);
 
-  // 5. Sharp, crisp foreground footage with subtle natural cinematic color balance
+  // 5. Sharp, crisp foreground footage clipped cleanly inside the center frame
   ctx.save();
+  ctx.beginPath();
+  ctx.rect(slotX, slotY, baseW, baseH);
+  ctx.clip();
   ctx.filter = 'contrast(1.04) saturate(1.05) brightness(1.01)';
-  ctx.drawImage(sourceVideo, fgX, fgY, fgW, fgH);
+  ctx.drawImage(sourceVideo, drawX, drawY, zoomedW, zoomedH);
   ctx.restore();
 
   // 6. Soft cinematic seam feathering at top & bottom boundaries of center footage
   const seamHeight = Math.max(6, Math.round(H * 0.008));
-  const topSeam = ctx.createLinearGradient(0, fgY, 0, fgY + seamHeight);
+  const topSeam = ctx.createLinearGradient(0, slotY, 0, slotY + seamHeight);
   topSeam.addColorStop(0, 'rgba(15, 35, 45, 0.25)');
   topSeam.addColorStop(1, 'rgba(15, 35, 45, 0)');
   ctx.fillStyle = topSeam;
-  ctx.fillRect(fgX, fgY, fgW, seamHeight);
+  ctx.fillRect(slotX, slotY, baseW, seamHeight);
 
-  const botSeam = ctx.createLinearGradient(0, fgY + fgH - seamHeight, 0, fgY + fgH);
+  const botSeam = ctx.createLinearGradient(0, slotY + baseH - seamHeight, 0, slotY + baseH);
   botSeam.addColorStop(0, 'rgba(8, 45, 54, 0)');
   botSeam.addColorStop(1, 'rgba(8, 45, 54, 0.35)');
   ctx.fillStyle = botSeam;
-  ctx.fillRect(fgX, fgY + fgH - seamHeight, fgW, seamHeight);
+  ctx.fillRect(slotX, slotY + baseH - seamHeight, baseW, seamHeight);
+}
+
+/**
+ * Generates an offscreen 16:9 reference scenic canvas (matching Image 2: clouds + alpine mountains)
+ * so the live style preview works immediately even before a user uploads a video.
+ */
+function renderReferenceLandscapeCanvas(offscreenCanvas, timeSec = 0) {
+  const W = offscreenCanvas.width;
+  const H = offscreenCanvas.height;
+  const ctx = offscreenCanvas.getContext('2d');
+
+  // Crisp alpine sky
+  const sky = ctx.createLinearGradient(0, 0, 0, H * 0.65);
+  sky.addColorStop(0, '#1e3a8a');
+  sky.addColorStop(0.55, '#60a5fa');
+  sky.addColorStop(1, '#dbeafe');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, H);
+
+  // Soft sunlit clouds
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.72)';
+  for (let i = 0; i < 6; i++) {
+    const cx = ((i * 190 + timeSec * 18) % (W + 220)) - 110;
+    const cy = 48 + (i % 3) * 34;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, 110, 32, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Distant teal-blue mountain ridges
+  ctx.fillStyle = '#0f4c5c';
+  ctx.beginPath();
+  ctx.moveTo(0, H);
+  ctx.lineTo(0, H * 0.56);
+  ctx.lineTo(W * 0.22, H * 0.43);
+  ctx.lineTo(W * 0.46, H * 0.54);
+  ctx.lineTo(W * 0.72, H * 0.38);
+  ctx.lineTo(W, H * 0.52);
+  ctx.lineTo(W, H);
+  ctx.closePath();
+  ctx.fill();
+
+  // Foreground deep emerald-teal peaks
+  ctx.fillStyle = '#062c36';
+  ctx.beginPath();
+  ctx.moveTo(0, H);
+  ctx.lineTo(0, H * 0.72);
+  ctx.lineTo(W * 0.34, H * 0.54);
+  ctx.lineTo(W * 0.64, H * 0.68);
+  ctx.lineTo(W * 0.88, H * 0.49);
+  ctx.lineTo(W, H * 0.62);
+  ctx.lineTo(W, H);
+  ctx.closePath();
+  ctx.fill();
 }
 
 async function renderAtmosphericCinematicClip({
@@ -1326,6 +1465,7 @@ async function renderAtmosphericCinematicClip({
   endTime,
   resolutionKey = '720p',
   speedMode = 'fast',
+  transform = DEFAULT_EDIT_TRANSFORM,
   onFrameProgress
 }) {
   const res = RESOLUTIONS[resolutionKey] || RESOLUTIONS['720p'];
@@ -1337,21 +1477,27 @@ async function renderAtmosphericCinematicClip({
   video.src = url;
   video.playsInline = true;
   video.preload = 'auto';
-  video.crossOrigin = 'anonymous';
 
   await new Promise((resolve, reject) => {
     video.onloadeddata = resolve;
     video.onerror = () => reject(new Error('Failed to load video stream for clip rendering.'));
   });
 
+  const safeStart = Math.max(0, Math.min(startTime, Math.max(0, video.duration - 1)));
+  const safeEnd = Math.max(safeStart + 1, Math.min(endTime, video.duration));
+
   // Seek to clip start
   await new Promise((resolve) => {
-    const onSeeked = () => {
-      video.removeEventListener('seeked', onSeeked);
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      video.removeEventListener('seeked', done);
       resolve();
     };
-    video.addEventListener('seeked', onSeeked);
-    video.currentTime = startTime;
+    video.addEventListener('seeked', done);
+    video.currentTime = safeStart;
+    setTimeout(done, 1200);
   });
 
   const canvas = document.createElement('canvas');
@@ -1360,16 +1506,21 @@ async function renderAtmosphericCinematicClip({
   const ctx = canvas.getContext('2d');
 
   // Render initial frame & capture high-res JPEG thumbnail
-  drawAtmosphericCinematicFrame(ctx, video, W, H);
-  const thumbnailDataUrl = canvas.toDataURL('image/jpeg', 0.84);
+  drawAtmosphericCinematicFrame(ctx, video, W, H, transform);
+  const thumbnailDataUrl = canvas.toDataURL('image/jpeg', 0.86);
 
-  // Set up audio routing (muted locally while capturing into MediaStream)
+  // Create a single smooth 30fps video stream from canvas
+  const canvasStream = canvas.captureStream(30);
+  let combinedStream = canvasStream;
   let audioCtx = null;
-  let combinedStream = canvas.captureStream(30);
+
   try {
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     if (AudioContextClass) {
       audioCtx = new AudioContextClass();
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume().catch(() => {});
+      }
       const sourceNode = audioCtx.createMediaElementSource(video);
       const destNode = audioCtx.createMediaStreamDestination();
       const muteGain = audioCtx.createGain();
@@ -1378,12 +1529,12 @@ async function renderAtmosphericCinematicClip({
       sourceNode.connect(muteGain);
       muteGain.connect(audioCtx.destination);
       const audioTracks = destNode.stream.getAudioTracks();
-      if (audioTracks.length > 0) {
-        combinedStream = new MediaStream([...canvas.captureStream(30).getVideoTracks(), ...audioTracks]);
+      if (audioTracks.length > 0 && audioCtx.state === 'running') {
+        combinedStream = new MediaStream([...canvasStream.getVideoTracks(), ...audioTracks]);
       }
     }
   } catch {
-    // Fallback to video-only stream if audio capture is restricted
+    combinedStream = canvasStream;
   }
 
   const preferredMimes = [
@@ -1392,13 +1543,14 @@ async function renderAtmosphericCinematicClip({
     'video/webm',
     'video/mp4'
   ];
-  const supportedMime = preferredMimes.find((m) => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)) || '';
+  const supportedMime =
+    preferredMimes.find((m) => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)) || '';
 
   const chunks = [];
   const recorder = supportedMime
     ? new MediaRecorder(combinedStream, {
         mimeType: supportedMime,
-        videoBitsPerSecond: resolutionKey === '1080p' ? 5000000 : 2800000
+        videoBitsPerSecond: resolutionKey === '1080p' ? 5000000 : 3000000
       })
     : new MediaRecorder(combinedStream);
 
@@ -1406,32 +1558,46 @@ async function renderAtmosphericCinematicClip({
     if (e.data && e.data.size > 0) chunks.push(e.data);
   };
 
-  const clipSpan = Math.max(1, endTime - startTime);
-  video.playbackRate = speedMode === 'fast' ? 2.0 : 1.0;
+  const clipSpan = Math.max(1, safeEnd - safeStart);
+  // Use smooth 1.0x or 1.5x playback to guarantee butter-smooth frames without drops
+  video.playbackRate = speedMode === 'fast' ? 1.5 : 1.0;
 
   return new Promise((resolve, reject) => {
-    let rafId = null;
+    let timerId = null;
     let finished = false;
+
+    const cleanup = () => {
+      if (timerId) clearInterval(timerId);
+      URL.revokeObjectURL(url);
+      if (audioCtx) audioCtx.close().catch(() => {});
+      video.remove();
+    };
 
     const finishRender = () => {
       if (finished) return;
       finished = true;
-      if (rafId) cancelAnimationFrame(rafId);
+      if (timerId) clearInterval(timerId);
       video.pause();
       if (recorder.state !== 'inactive') {
+        try {
+          recorder.requestData();
+        } catch {}
         recorder.stop();
       }
     };
 
     recorder.onstop = () => {
-      const blob = new Blob(chunks, { type: recorder.mimeType || 'video/webm' });
-      URL.revokeObjectURL(url);
-      if (audioCtx) audioCtx.close().catch(() => {});
-      video.remove();
+      const mime = recorder.mimeType || supportedMime || 'video/webm';
+      const blob = new Blob(chunks, { type: mime });
+      cleanup();
+      if (!blob || blob.size === 0) {
+        reject(new Error('Rendered video buffer was empty. Please try switching Render Encoding Speed to 1x Realtime in Settings.'));
+        return;
+      }
       resolve({
         blob,
         thumbnailDataUrl,
-        mimeType: blob.type || 'video/webm',
+        mimeType: mime,
         width: W,
         height: H
       });
@@ -1439,34 +1605,32 @@ async function renderAtmosphericCinematicClip({
 
     recorder.onerror = (err) => {
       finished = true;
-      if (rafId) cancelAnimationFrame(rafId);
-      URL.revokeObjectURL(url);
-      if (audioCtx) audioCtx.close().catch(() => {});
-      video.remove();
+      cleanup();
       reject(new Error(err?.error?.message || 'Video encoding error during clip render.'));
     };
 
-    const renderLoop = () => {
+    // High-precision 30fps pump that stays smooth and reliable
+    const pumpFrame = () => {
       if (finished) return;
-      drawAtmosphericCinematicFrame(ctx, video, W, H);
-      const pct = Math.min(100, Math.max(0, ((video.currentTime - startTime) / clipSpan) * 100));
+      drawAtmosphericCinematicFrame(ctx, video, W, H, transform);
+      const pct = Math.min(100, Math.max(0, ((video.currentTime - safeStart) / clipSpan) * 100));
       if (onFrameProgress) onFrameProgress(pct);
 
-      if (video.currentTime >= endTime || video.ended) {
+      if (video.currentTime >= safeEnd || video.ended) {
         finishRender();
-        return;
       }
-      rafId = requestAnimationFrame(renderLoop);
     };
 
-    recorder.start(250);
+    recorder.start(200);
     video
       .play()
       .then(() => {
-        rafId = requestAnimationFrame(renderLoop);
+        pumpFrame();
+        timerId = setInterval(pumpFrame, 1000 / 30);
       })
       .catch((err) => {
-        finishRender();
+        finished = true;
+        cleanup();
         reject(new Error(`Playback blocked during render: ${err.message}`));
       });
   });
@@ -1703,24 +1867,320 @@ function ScoreMetricBar({ label, score, accent = 'cyan' }) {
   );
 }
 
-function AtmosphericStyleSchematic() {
+/**
+ * Precision Ruler Tick-Mark Slider matching the uploaded reference UI (1000340825.png)
+ * Supports smooth mouse & touch dragging on mobile and desktop.
+ */
+function PrecisionTickSlider({ label, value, min, max, step = 1, unit = '%', onChange }) {
+  const trackRef = useRef(null);
+  const [dragging, setDragging] = useState(false);
+
+  const updateFromClientX = useCallback(
+    (clientX) => {
+      const el = trackRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+      const raw = min + ratio * (max - min);
+      const stepped = Math.round(raw / step) * step;
+      onChange(Math.max(min, Math.min(max, stepped)));
+    },
+    [min, max, step, onChange]
+  );
+
+  useEffect(() => {
+    if (!dragging) return;
+    const onMove = (e) => {
+      const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+      updateFromClientX(clientX);
+    };
+    const onUp = () => setDragging(false);
+
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    window.addEventListener('touchmove', onMove, { passive: true });
+    window.addEventListener('touchend', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('touchmove', onMove);
+      window.removeEventListener('touchend', onUp);
+    };
+  }, [dragging, updateFromClientX]);
+
+  const ratio = (value - min) / (max - min || 1);
+  const tickCount = 41;
+
   return (
-    <div className="relative w-24 h-40 rounded-lg overflow-hidden border border-cyan-500/30 shadow-lg shrink-0 bg-[#07262e] select-none">
-      {/* Top blurred sky extension */}
-      <div className="h-[32%] w-full bg-gradient-to-b from-slate-300/60 via-sky-200/45 to-slate-400/50 blur-[2px] flex items-center justify-center">
-        <span className="text-[8px] font-mono uppercase tracking-wider text-slate-900/80 font-bold">Soft Blur</span>
+    <div className="flex items-center justify-between gap-3 py-1.5 select-none">
+      <span className="text-xs font-medium text-slate-300 w-20 shrink-0">{label}</span>
+
+      <div
+        ref={trackRef}
+        role="slider"
+        tabIndex={0}
+        aria-label={label}
+        aria-valuemin={min}
+        aria-valuemax={max}
+        aria-valuenow={value}
+        onKeyDown={(e) => {
+          if (e.key === 'ArrowLeft') onChange(Math.max(min, value - step));
+          if (e.key === 'ArrowRight') onChange(Math.min(max, value + step));
+        }}
+        onMouseDown={(e) => {
+          setDragging(true);
+          updateFromClientX(e.clientX);
+        }}
+        onTouchStart={(e) => {
+          setDragging(true);
+          updateFromClientX(e.touches[0].clientX);
+        }}
+        className="relative flex-1 h-9 rounded-lg bg-[#161920] border border-slate-800/90 overflow-hidden cursor-ew-resize flex items-center px-2 touch-none"
+      >
+        {/* Subtle edge vignette matching reference image */}
+        <div className="pointer-events-none absolute inset-y-0 left-0 w-6 bg-gradient-to-r from-[#161920] to-transparent z-10" />
+        <div className="pointer-events-none absolute inset-y-0 right-0 w-6 bg-gradient-to-l from-[#161920] to-transparent z-10" />
+
+        {/* Ruler vertical tick marks */}
+        <div className="w-full flex items-center justify-between">
+          {Array.from({ length: tickCount }).map((_, idx) => {
+            const isMajor = idx % 5 === 0;
+            const isCenter = idx === Math.floor(tickCount / 2);
+            return (
+              <span
+                key={idx}
+                className={`w-[1.5px] rounded-full transition-colors ${
+                  isCenter
+                    ? 'h-4 bg-slate-400'
+                    : isMajor
+                      ? 'h-3.5 bg-slate-500/80'
+                      : 'h-2.5 bg-slate-700/80'
+                }`}
+              />
+            );
+          })}
+        </div>
+
+        {/* Active Cyan Position Indicator Bar */}
+        <div
+          className="pointer-events-none absolute top-1.5 bottom-1.5 w-[2.5px] bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.85)] rounded-full z-20 transition-[left] duration-75"
+          style={{ left: `calc(${ratio * 100}% - 1px)` }}
+        />
       </div>
-      {/* Center sharp 16:9 landscape focal area */}
-      <div className="h-[34%] w-full relative bg-gradient-to-br from-sky-500 via-teal-600 to-emerald-900 border-y border-white/25 flex flex-col items-center justify-center px-1 text-center">
-        <span className="text-[8px] font-mono uppercase tracking-wider text-white font-bold drop-shadow">
-          Sharp 16:9 Focus
-        </span>
+
+      <span className="text-xs font-mono font-semibold text-slate-200 w-12 text-right shrink-0">
+        {value}
+        {unit}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * Live 9:16 Style & Framing Preview Canvas placed right above the Sumbu X, Sumbu Y,
+ * Zoom, and Efek Blur sliders so creators can preview their composition in real time.
+ */
+function LiveStylePreviewEditor({ videoFile, transform, onChangeTransform }) {
+  const previewCanvasRef = useRef(null);
+  const hiddenVideoRef = useRef(null);
+  const fallbackCanvasRef = useRef(null);
+  const [isPlaying, setIsPlaying] = useState(true);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(10);
+  const [videoObjectUrl, setVideoObjectUrl] = useState(null);
+
+  useEffect(() => {
+    if (!videoFile) {
+      setVideoObjectUrl(null);
+      return;
+    }
+    const url = URL.createObjectURL(videoFile);
+    setVideoObjectUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [videoFile]);
+
+  useEffect(() => {
+    let rafId = null;
+    let startWall = performance.now();
+
+    if (!fallbackCanvasRef.current) {
+      const c = document.createElement('canvas');
+      c.width = 640;
+      c.height = 360;
+      fallbackCanvasRef.current = c;
+    }
+
+    const renderPreviewLoop = () => {
+      const canvas = previewCanvasRef.current;
+      if (canvas) {
+        const ctx = canvas.getContext('2d');
+        const vid = hiddenVideoRef.current;
+        if (videoObjectUrl && vid && vid.readyState >= 2) {
+          drawAtmosphericCinematicFrame(ctx, vid, canvas.width, canvas.height, transform);
+          setCurrentTime(vid.currentTime || 0);
+        } else {
+          const elapsed = isPlaying ? (performance.now() - startWall) / 1000 : 1.5;
+          renderReferenceLandscapeCanvas(fallbackCanvasRef.current, elapsed);
+          drawAtmosphericCinematicFrame(ctx, fallbackCanvasRef.current, canvas.width, canvas.height, transform);
+        }
+      }
+      rafId = requestAnimationFrame(renderPreviewLoop);
+    };
+
+    rafId = requestAnimationFrame(renderPreviewLoop);
+    return () => {
+      if (rafId) cancelAnimationFrame(rafId);
+    };
+  }, [videoObjectUrl, transform, isPlaying]);
+
+  const togglePreviewPlay = () => {
+    const vid = hiddenVideoRef.current;
+    if (videoObjectUrl && vid) {
+      if (vid.paused) {
+        vid.play().then(() => setIsPlaying(true)).catch(() => {});
+      } else {
+        vid.pause();
+        setIsPlaying(false);
+      }
+    } else {
+      setIsPlaying((p) => !p);
+    }
+  };
+
+  const isModified =
+    transform.offsetX !== 0 || transform.offsetY !== 0 || transform.zoom !== 100 || transform.blur !== 100;
+
+  return (
+    <div className="rounded-xl bg-[#0A0D12] border border-slate-800/90 p-3.5 space-y-3.5">
+      <div className="flex items-center justify-between">
+        <div>
+          <span className="text-xs font-semibold text-white block">Live 9:16 Style & Framing Preview</span>
+          <span className="text-[11px] text-slate-400">
+            {videoFile ? 'Previewing uploaded video in Atmospheric Cinematic preset' : 'Default Atmospheric Cinematic reference preview'}
+          </span>
+        </div>
+        {isModified && (
+          <button
+            type="button"
+            onClick={() => onChangeTransform({ ...DEFAULT_EDIT_TRANSFORM })}
+            className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-[11px] text-cyan-300 border border-slate-700"
+          >
+            <RotateCcw className="w-3 h-3" />
+            Reset
+          </button>
+        )}
       </div>
-      {/* Bottom dark teal cinematic gradient */}
-      <div className="h-[34%] w-full bg-gradient-to-b from-[#0d4a56] via-[#07303a] to-[#03181f] flex items-center justify-center px-1 text-center">
-        <span className="text-[8px] font-mono uppercase tracking-wider text-teal-200/80 font-semibold">
-          Teal Gradient
-        </span>
+
+      {/* Hidden source video element driving the live canvas */}
+      {videoObjectUrl && (
+        <video
+          ref={hiddenVideoRef}
+          src={videoObjectUrl}
+          muted
+          loop
+          autoPlay
+          playsInline
+          onLoadedMetadata={(e) => {
+            setDuration(e.currentTarget.duration || 10);
+            e.currentTarget.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
+          }}
+          className="hidden"
+        />
+      )}
+
+      {/* 9:16 Live Preview Frame */}
+      <div className="relative mx-auto w-full max-w-[210px] aspect-[9/16] rounded-xl overflow-hidden border border-cyan-500/35 shadow-2xl bg-[#051820] group">
+        <canvas ref={previewCanvasRef} width={360} height={640} className="w-full h-full object-contain block" />
+
+        {/* Play/Pause Overlay Button */}
+        <button
+          type="button"
+          onClick={togglePreviewPlay}
+          aria-label={isPlaying ? 'Pause live preview' : 'Play live preview'}
+          className="absolute inset-0 flex items-center justify-center bg-black/20 opacity-0 group-hover:opacity-100 focus:opacity-100 transition"
+        >
+          <span className="w-10 h-10 rounded-full bg-cyan-500/90 text-slate-950 flex items-center justify-center shadow-lg">
+            {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4 ml-0.5" />}
+          </span>
+        </button>
+
+        <div className="absolute top-2 left-2 right-2 flex items-center justify-between pointer-events-none">
+          <span className="px-1.5 py-0.5 rounded bg-black/65 text-[9px] font-mono text-cyan-300 border border-white/10">
+            9:16 LIVE
+          </span>
+          <span className="px-1.5 py-0.5 rounded bg-black/65 text-[9px] font-mono text-slate-200 border border-white/10">
+            Z:{transform.zoom}% B:{transform.blur}%
+          </span>
+        </div>
+      </div>
+
+      {/* Timeline Scrubber when a real video is loaded */}
+      {videoObjectUrl && (
+        <div className="flex items-center gap-2 px-1">
+          <button
+            type="button"
+            onClick={togglePreviewPlay}
+            className="p-1.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200"
+            aria-label={isPlaying ? 'Pause' : 'Play'}
+          >
+            {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+          </button>
+          <input
+            type="range"
+            min={0}
+            max={Math.max(1, duration)}
+            step={0.1}
+            value={currentTime}
+            onChange={(e) => {
+              const t = Number(e.target.value);
+              setCurrentTime(t);
+              if (hiddenVideoRef.current) hiddenVideoRef.current.currentTime = t;
+            }}
+            aria-label="Preview timeline scrubber"
+            className="flex-1 accent-cyan-400 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
+          />
+          <span className="text-[10px] font-mono text-slate-400 shrink-0">{formatTimecode(currentTime)}</span>
+        </div>
+      )}
+
+      {/* Precision Tick-Mark Controls: Sumbu X, Sumbu Y, Zoom, Efek Blur */}
+      <div className="pt-2 border-t border-slate-800/80 space-y-1">
+        <PrecisionTickSlider
+          label="Sumbu x"
+          value={transform.offsetX}
+          min={-100}
+          max={100}
+          step={1}
+          unit="%"
+          onChange={(val) => onChangeTransform((prev) => ({ ...prev, offsetX: val }))}
+        />
+        <PrecisionTickSlider
+          label="Sumbu y"
+          value={transform.offsetY}
+          min={-100}
+          max={100}
+          step={1}
+          unit="%"
+          onChange={(val) => onChangeTransform((prev) => ({ ...prev, offsetY: val }))}
+        />
+        <PrecisionTickSlider
+          label="Zoom"
+          value={transform.zoom}
+          min={50}
+          max={250}
+          step={1}
+          unit="%"
+          onChange={(val) => onChangeTransform((prev) => ({ ...prev, zoom: val }))}
+        />
+        <PrecisionTickSlider
+          label="Efek Blur"
+          value={transform.blur}
+          min={0}
+          max={200}
+          step={1}
+          unit="%"
+          onChange={(val) => onChangeTransform((prev) => ({ ...prev, blur: val }))}
+        />
       </div>
     </div>
   );
@@ -1739,12 +2199,18 @@ function ClipResultCard({
   geminiModel,
   briefRules,
   hasVideoFile,
+  sourceVideoFile,
   onUpdateClip,
   onDeleteClip,
   onNotify
 }) {
   const [videoUrl, setVideoUrl] = useState(null);
+  const [videoBlobSize, setVideoBlobSize] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [showPreviewModal, setShowPreviewModal] = useState(false);
+  const [showTransformEditor, setShowTransformEditor] = useState(false);
+  const [clipTransform, setClipTransform] = useState(clip.transform || { ...DEFAULT_EDIT_TRANSFORM });
+  const [rerenderingClip, setRerenderingClip] = useState(false);
   const [activeTab, setActiveTab] = useState('hooks');
   const [editingField, setEditingField] = useState(null);
   const [editDraft, setEditDraft] = useState('');
@@ -1757,9 +2223,10 @@ function ClipResultCard({
     let objectUrl = null;
     StudioDB.getClipBlob(clip.id)
       .then((blob) => {
-        if (active && blob) {
+        if (active && blob && blob.size > 0) {
           objectUrl = URL.createObjectURL(blob);
           setVideoUrl(objectUrl);
+          setVideoBlobSize(blob.size);
         }
       })
       .catch(() => {});
@@ -1767,7 +2234,7 @@ function ClipResultCard({
       active = false;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [clip.id]);
+  }, [clip.id, clip.renderedVersion]);
 
   const togglePlay = () => {
     const v = videoRef.current;
@@ -1777,6 +2244,65 @@ function ClipResultCard({
     } else {
       v.pause();
       setIsPlaying(false);
+    }
+  };
+
+  const handleDownloadClip = async () => {
+    try {
+      const blob = await StudioDB.getClipBlob(clip.id);
+      if (!blob || blob.size === 0) {
+        onNotify('Video file is not available yet. Upload a source video file to render downloadable clips.', 'error');
+        return;
+      }
+      const ext = (blob.type || '').includes('mp4') ? 'mp4' : 'webm';
+      const filename = `Rank${rank}_${sanitizeFilename(clip.title)}_${clip.resolution}.${ext}`;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.style.display = 'none';
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        a.remove();
+        URL.revokeObjectURL(url);
+      }, 4000);
+      onNotify(`Downloading ${filename} (${formatBytes(blob.size)})`, 'success');
+    } catch {
+      onNotify('Failed to export video clip.', 'error');
+    }
+  };
+
+  const handleRerenderWithTransform = async () => {
+    if (!sourceVideoFile) {
+      onNotify('Original source video file is needed in memory to re-render framing.', 'error');
+      return;
+    }
+    setRerenderingClip(true);
+    try {
+      const rendered = await renderAtmosphericCinematicClip({
+        file: sourceVideoFile,
+        startTime: clip.startTime,
+        endTime: clip.endTime,
+        resolutionKey: clip.resolution || '720p',
+        speedMode: 'fast',
+        transform: clipTransform
+      });
+      await StudioDB.saveSingleClipBlob(clip.id, clip.projectId, rendered.blob);
+      const updated = {
+        ...clip,
+        transform: { ...clipTransform },
+        thumbnailDataUrl: rendered.thumbnailDataUrl,
+        renderedMimeType: rendered.mimeType,
+        renderedVersion: (clip.renderedVersion || 1) + 1
+      };
+      await onUpdateClip(updated);
+      setShowTransformEditor(false);
+      onNotify('Clip re-rendered with updated X/Y, Zoom & Blur settings!', 'success');
+    } catch (err) {
+      onNotify(err.message || 'Failed to re-render clip.', 'error');
+    } finally {
+      setRerenderingClip(false);
     }
   };
 
@@ -2002,22 +2528,12 @@ function ClipResultCard({
                     src={videoUrl}
                     poster={clip.thumbnailDataUrl || undefined}
                     playsInline
-                    loop
+                    controls
+                    preload="metadata"
                     onPlay={() => setIsPlaying(true)}
                     onPause={() => setIsPlaying(false)}
-                    onClick={togglePlay}
-                    className="w-full h-full object-contain cursor-pointer"
+                    className="w-full h-full object-contain bg-black"
                   />
-                  <button
-                    type="button"
-                    onClick={togglePlay}
-                    aria-label={isPlaying ? 'Pause video' : 'Play video'}
-                    className="absolute inset-0 flex items-center justify-center bg-black/25 opacity-0 group-hover:opacity-100 focus:opacity-100 transition"
-                  >
-                    <span className="w-12 h-12 rounded-full bg-cyan-500/90 text-slate-950 flex items-center justify-center shadow-lg">
-                      {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5 ml-0.5" />}
-                    </span>
-                  </button>
                 </>
               ) : clip.thumbnailDataUrl ? (
                 <img src={clip.thumbnailDataUrl} alt={clip.title} className="w-full h-full object-cover" />
@@ -2047,29 +2563,152 @@ function ClipResultCard({
               </div>
             </div>
 
-            {/* Player Controls & Download */}
-            <div className="mt-4 flex items-center gap-2 max-w-[250px] mx-auto">
-              {videoUrl && (
+            {/* Player Controls, Preview Modal & Download */}
+            <div className="mt-4 space-y-2 max-w-[260px] mx-auto">
+              <div className="flex items-center gap-2">
+                {videoUrl && (
+                  <button
+                    type="button"
+                    onClick={() => setShowPreviewModal(true)}
+                    className="flex-1 inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs font-medium border border-slate-700 transition"
+                  >
+                    <Eye className="w-3.5 h-3.5 text-cyan-400" />
+                    Preview
+                  </button>
+                )}
                 <button
                   type="button"
-                  onClick={togglePlay}
-                  className="flex-1 inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs font-medium border border-slate-700 transition"
+                  onClick={handleDownloadClip}
+                  disabled={!videoUrl}
+                  className="flex-1 inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-cyan-500 hover:bg-cyan-400 disabled:bg-slate-800 disabled:text-slate-500 text-slate-950 text-xs font-semibold transition"
                 >
-                  {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
-                  {isPlaying ? 'Pause' : 'Play'}
+                  <Download className="w-3.5 h-3.5" />
+                  {videoBlobSize > 0 ? `Download (${formatBytes(videoBlobSize)})` : 'Download'}
+                </button>
+              </div>
+
+              {sourceVideoFile && (
+                <button
+                  type="button"
+                  onClick={() => setShowTransformEditor((v) => !v)}
+                  className="w-full inline-flex items-center justify-center gap-1.5 py-1.5 px-3 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-300 text-[11px] font-medium border border-slate-800 transition"
+                >
+                  <Sliders className="w-3 h-3 text-cyan-400" />
+                  {showTransformEditor ? 'Close Framing & Blur Editor' : 'Adjust X/Y, Zoom & Blur'}
                 </button>
               )}
-              <button
-                type="button"
-                onClick={handleDownloadClip}
-                disabled={!videoUrl}
-                className="flex-1 inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-cyan-500 hover:bg-cyan-400 disabled:bg-slate-800 disabled:text-slate-500 text-slate-950 text-xs font-semibold transition"
-              >
-                <Download className="w-3.5 h-3.5" />
-                Download
-              </button>
+
+              {showTransformEditor && sourceVideoFile && (
+                <div className="p-3 rounded-xl bg-slate-900/90 border border-slate-800 space-y-2">
+                  <PrecisionTickSlider
+                    label="Sumbu x"
+                    value={clipTransform.offsetX}
+                    min={-100}
+                    max={100}
+                    onChange={(v) => setClipTransform((p) => ({ ...p, offsetX: v }))}
+                  />
+                  <PrecisionTickSlider
+                    label="Sumbu y"
+                    value={clipTransform.offsetY}
+                    min={-100}
+                    max={100}
+                    onChange={(v) => setClipTransform((p) => ({ ...p, offsetY: v }))}
+                  />
+                  <PrecisionTickSlider
+                    label="Zoom"
+                    value={clipTransform.zoom}
+                    min={50}
+                    max={250}
+                    onChange={(v) => setClipTransform((p) => ({ ...p, zoom: v }))}
+                  />
+                  <PrecisionTickSlider
+                    label="Efek Blur"
+                    value={clipTransform.blur}
+                    min={0}
+                    max={200}
+                    onChange={(v) => setClipTransform((p) => ({ ...p, blur: v }))}
+                  />
+                  <button
+                    type="button"
+                    onClick={handleRerenderWithTransform}
+                    disabled={rerenderingClip}
+                    className="w-full py-2 px-3 rounded-lg bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 text-slate-950 font-semibold text-xs flex items-center justify-center gap-1.5"
+                  >
+                    {rerenderingClip ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        Re-rendering Clip...
+                      </>
+                    ) : (
+                      'Apply & Re-render Video'
+                    )}
+                  </button>
+                </div>
+              )}
             </div>
           </div>
+
+          {/* Fullscreen-Style Pre-Download Video Preview Modal */}
+          {showPreviewModal && videoUrl && (
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label={`Preview ${clip.title}`}
+              onClick={() => setShowPreviewModal(false)}
+              className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-center justify-center p-4"
+            >
+              <div
+                onClick={(e) => e.stopPropagation()}
+                className="bg-[#11151C] border border-slate-700 rounded-2xl max-w-md w-full p-4 space-y-4 shadow-2xl"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <span className="text-[11px] font-mono text-cyan-400">
+                      PREVIEW • {clip.resolution === '1080p' ? '1080×1920' : '720×1280'}
+                    </span>
+                    <h4 className="text-sm font-semibold text-white truncate">{clip.title}</h4>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowPreviewModal(false)}
+                    className="p-1.5 rounded-lg bg-slate-800 text-slate-300 hover:text-white"
+                    aria-label="Close preview"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                <div className="mx-auto w-full max-w-[290px] aspect-[9/16] rounded-xl overflow-hidden bg-black border border-slate-700">
+                  <video
+                    src={videoUrl}
+                    controls
+                    autoPlay
+                    playsInline
+                    loop
+                    className="w-full h-full object-contain"
+                  />
+                </div>
+
+                <div className="flex items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowPreviewModal(false)}
+                    className="px-4 py-2 rounded-lg bg-slate-800 text-slate-200 text-xs font-medium"
+                  >
+                    Close
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDownloadClip}
+                    className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-bold"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    Download Video
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Viral Score Card */}
           <div className="bg-[#131822] border border-slate-800 rounded-xl p-4 space-y-3">
@@ -2709,6 +3348,7 @@ export default function App() {
 
   // Section D: Editing & Clipping Settings
   const [clippingStyle, setClippingStyle] = useState('atmospheric-cinematic');
+  const [editTransform, setEditTransform] = useState({ ...DEFAULT_EDIT_TRANSFORM });
   const [resolution, setResolution] = useState('720p');
   const [targetDuration, setTargetDuration] = useState(30);
   const [clipQuantity, setClipQuantity] = useState(5);
@@ -3082,6 +3722,7 @@ export default function App() {
           projectId: snapshot.projectId,
           rank: idx + 1,
           style: clippingStyle,
+          transform: { ...editTransform },
           resolution,
           thumbnailDataUrl: snapshot.rankedClips[idx]?.thumbnailDataUrl || youtubeMeta?.thumbnailUrl || ''
         }));
@@ -3120,6 +3761,7 @@ export default function App() {
               endTime: clip.endTime,
               resolutionKey: resolution,
               speedMode: appSettings.renderSpeedMode,
+              transform: editTransform,
               onFrameProgress: (clipPct) => {
                 const subPct = basePct + Math.round((clipPct / 100) * (28 / total));
                 setJobState((prev) => ({ ...prev, overallPercent: Math.min(90, subPct) }));
@@ -3128,6 +3770,7 @@ export default function App() {
             snapshot.renderedBlobs[clip.id] = rendered.blob;
             clip.thumbnailDataUrl = rendered.thumbnailDataUrl;
             clip.renderedMimeType = rendered.mimeType;
+            clip.renderedVersion = 1;
           }
         }
         updateProgress(7, 91, 'All candidate clips processed.', {
@@ -3164,6 +3807,7 @@ export default function App() {
         briefRules: snapshot.extractedBriefRules,
         settings: {
           style: clippingStyle,
+          transform: { ...editTransform },
           resolution,
           targetDuration,
           clipQuantity
@@ -3842,15 +4486,10 @@ export default function App() {
                         <Sliders className="w-4 h-4" />
                       </div>
                       <div>
-                        <h2 className="text-sm font-semibold text-white">Section D — Video Editing & Clipping Settings</h2>
-                        <p className="text-xs text-slate-400">Configure visual style, resolution, pacing, and quantity.</p>
-                      </div>
-                    </div>
-
-                    {/* D1. CLIPPING STYLE */}
-                    <div className="space-y-2.5">
+                    {/* D1. CLIPPING STYLE + LIVE PREVIEW + SUMBU X / Y / ZOOM / BLUR */}
+                    <div className="space-y-3">
                       <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400">
-                        D1. Clipping Style Preset
+                        D1. Clipping Style & Framing Controls
                       </label>
                       {Object.values(CLIPPING_STYLES).map((style) => {
                         const selected = clippingStyle === style.id;
@@ -3858,29 +4497,34 @@ export default function App() {
                           <div
                             key={style.id}
                             onClick={() => setClippingStyle(style.id)}
-                            className={`p-3.5 rounded-xl border flex items-center gap-4 cursor-pointer transition ${
+                            className={`p-3.5 rounded-xl border cursor-pointer transition ${
                               selected
                                 ? 'bg-cyan-950/20 border-cyan-500/50'
                                 : 'bg-[#0A0D12] border-slate-800 hover:border-slate-700'
                             }`}
                           >
-                            <AtmosphericStyleSchematic />
-                            <div className="space-y-1.5">
+                            <div className="space-y-1">
                               <div className="flex flex-wrap items-center gap-2">
                                 <span className="text-sm font-semibold text-white">{style.name}</span>
                                 <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300">
                                   {style.aspectRatio}
                                 </span>
+                                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-teal-500/15 text-teal-300">
+                                  Default Style
+                                </span>
                               </div>
                               <p className="text-xs text-slate-400 leading-relaxed">{style.description}</p>
-                              <ul className="text-[11px] text-teal-300/90 space-y-0.5 pt-1">
-                                <li>• Sharp uncropped center subject</li>
-                                <li>• Blurred top sky extension + dark teal lower gradient</li>
-                              </ul>
                             </div>
                           </div>
                         );
                       })}
+
+                      {/* Live 9:16 Preview + Precision Tick Sliders (Sumbu X, Sumbu Y, Zoom, Efek Blur) */}
+                      <LiveStylePreviewEditor
+                        videoFile={videoFile}
+                        transform={editTransform}
+                        onChangeTransform={setEditTransform}
+                      />
                     </div>
 
                     {/* D2. RESOLUTION */}
@@ -4250,6 +4894,7 @@ export default function App() {
                         geminiModel={appSettings.geminiModel}
                         briefRules={activeProject.briefRules}
                         hasVideoFile={activeProject.sourceType === 'uploaded_video'}
+                        sourceVideoFile={videoFile}
                         onUpdateClip={handleUpdateClip}
                         onDeleteClip={handleDeleteClip}
                         onNotify={notify}
@@ -4645,3 +5290,4 @@ export default function App() {
     </StudioErrorBoundary>
   );
 }
+```
