@@ -55,15 +55,15 @@ const CLIPPING_STYLES = {
     badge: 'Default Preset',
     aspectRatio: '9:16',
     description:
-      'Vertical 9:16 composition with sharp centered original footage, enlarged soft-blurred top sky extension, and a deep dark-teal cinematic gradient atmosphere below.'
+      'Vertical 9:16 composition with a resizable sharp foreground overlay, enlarged soft-blurred top sky extension, and a deep dark-teal cinematic gradient atmosphere below.'
   }
 };
 
 const DEFAULT_EDIT_TRANSFORM = {
   offsetX: 0, // Sumbu X (-100% to +100%, default 0%)
   offsetY: 0, // Sumbu Y (-100% to +100%, default 0%)
-  zoom: 100, // Zoom (50% to 250%, default 100%)
-  blur: 100 // Efek Blur (0% to 200%, default 100%)
+  zoom: 100, // Zoom ukuran overlay tidak diblur (30% to 320%, default 100%)
+  blur: 100 // Efek Blur background (0% to 200%, default 100%)
 };
 
 const RESOLUTIONS = {
@@ -185,7 +185,7 @@ function parseYouTubeUrl(rawUrl) {
     valid: true,
     videoId,
     canonicalUrl: `https://www.youtube.com/watch?v=${videoId}`,
-    thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`
+    thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`
   };
 }
 
@@ -218,7 +218,8 @@ async function verifyYouTubeMetadata(rawUrl) {
       title: data.title || `YouTube Video (${parsed.videoId})`,
       channelName: data.author_name || 'Unknown Channel',
       channelUrl: data.author_url || '',
-      thumbnailUrl: data.thumbnail_url || parsed.thumbnailUrl,
+      thumbnailUrl: parsed.thumbnailUrl,
+      oembedThumbnailUrl: data.thumbnail_url || parsed.thumbnailUrl,
       width: data.width || 1280,
       height: data.height || 720,
       verifiedAt: new Date().toISOString()
@@ -1276,38 +1277,62 @@ async function extractTimelineKeyframes(file, duration, desiredFrameCount = 12) 
 }
 
 /**
- * Draws a single frame in the exact "Atmospheric Cinematic" 9:16 composition
- * with user-adjustable Sumbu X (offsetX %), Sumbu Y (offsetY %), Zoom (zoom %),
- * and Efek Blur (blur %).
+ * Draws a single frame in the exact "Atmospheric Cinematic" 9:16 composition:
+ * - Full-bleed blurred background (adjustable via Efek Blur 0%..200%)
+ * - Dark teal / blue-green cinematic gradient in the lower area + soft light bloom
+ * - Unblurred foreground OVERLAY whose actual bounding box (overlayW × overlayH)
+ *   grows larger or shrinks with Zoom (30%..320%) and moves with Sumbu X / Sumbu Y.
  */
-function drawAtmosphericCinematicFrame(ctx, sourceVideo, W, H, transform = DEFAULT_EDIT_TRANSFORM) {
-  const vw = sourceVideo.videoWidth || sourceVideo.width || 1280;
-  const vh = sourceVideo.videoHeight || sourceVideo.height || 720;
-  const srcAspect = vw / vh;
+function drawAtmosphericCinematicFrame(
+  ctx,
+  mediaSource,
+  W,
+  H,
+  transform = DEFAULT_EDIT_TRANSFORM,
+  options = {}
+) {
+  const { showOverlayGuide = false } = options;
+
+  const vw =
+    mediaSource?.videoWidth ||
+    mediaSource?.naturalWidth ||
+    mediaSource?.width ||
+    1280;
+  const vh =
+    mediaSource?.videoHeight ||
+    mediaSource?.naturalHeight ||
+    mediaSource?.height ||
+    720;
+  const srcAspect = vw > 0 && vh > 0 ? vw / vh : 16 / 9;
 
   const offsetX = Number.isFinite(transform?.offsetX) ? transform.offsetX : 0;
   const offsetY = Number.isFinite(transform?.offsetY) ? transform.offsetY : 0;
   const zoomPct = Number.isFinite(transform?.zoom) ? transform.zoom : 100;
   const blurPct = Number.isFinite(transform?.blur) ? transform.blur : 100;
 
-  const zoomFactor = Math.max(0.5, Math.min(2.5, zoomPct / 100));
+  const zoomFactor = Math.max(0.3, Math.min(3.5, zoomPct / 100));
   const blurPx = Math.max(0, Math.round(34 * (blurPct / 100)));
 
-  // 1. Background: enlarged cover scale with adjustable atmospheric blur
+  // 1. Background layer: enlarged cover scale with adjustable atmospheric blur
   ctx.save();
   const coverScale = Math.max(W / vw, H / vh) * 1.24;
   const bgW = vw * coverScale;
   const bgH = vh * coverScale;
-  const bgX = (W - bgW) / 2 + (offsetX / 100) * (W * 0.15);
-  const bgY = (H - bgH) / 2 + (offsetY / 100) * (H * 0.15);
+  const bgX = (W - bgW) / 2;
+  const bgY = (H - bgH) / 2;
 
   ctx.fillStyle = '#07222b';
   ctx.fillRect(0, 0, W, H);
-  ctx.filter = blurPx > 0 ? `blur(${blurPx}px) saturate(1.12) brightness(0.94)` : 'saturate(1.08) brightness(0.94)';
-  ctx.drawImage(sourceVideo, bgX, bgY, bgW, bgH);
+  if (mediaSource) {
+    ctx.filter =
+      blurPx > 0
+        ? `blur(${blurPx}px) saturate(1.12) brightness(0.94)`
+        : 'saturate(1.08) brightness(0.94)';
+    ctx.drawImage(mediaSource, bgX, bgY, bgW, bgH);
+  }
   ctx.restore();
 
-  // 2. Calculate base foreground window & apply Zoom + Sumbu X / Sumbu Y framing
+  // 2. Calculate base overlay box at 100% zoom, then scale BOTH width & height by zoomFactor
   let baseW, baseH;
   if (srcAspect >= 1.0) {
     baseW = W;
@@ -1317,27 +1342,25 @@ function drawAtmosphericCinematicFrame(ctx, sourceVideo, W, H, transform = DEFAU
     baseW = Math.round(baseH * srcAspect);
   }
 
-  const slotX = Math.round((W - baseW) / 2);
-  const slotY = Math.round((H - baseH) / 2);
+  const overlayW = Math.round(baseW * zoomFactor);
+  const overlayH = Math.round(baseH * zoomFactor);
+  const panX = (offsetX / 100) * (W * 0.5);
+  const panY = (offsetY / 100) * (H * 0.5);
+  const overlayX = Math.round((W - overlayW) / 2 + panX);
+  const overlayY = Math.round((H - overlayH) / 2 + panY);
 
-  const zoomedW = baseW * zoomFactor;
-  const zoomedH = baseH * zoomFactor;
-  const panX = (offsetX / 100) * (baseW * 0.5);
-  const panY = (offsetY / 100) * (baseH * 0.5);
-  const drawX = slotX + (baseW - zoomedW) / 2 + panX;
-  const drawY = slotY + (baseH - zoomedH) / 2 + panY;
-
-  // 3. Top subtle atmospheric veil for contrast balance
-  if (slotY > 0) {
-    const topGrad = ctx.createLinearGradient(0, 0, 0, slotY);
+  // 3. Top subtle atmospheric veil
+  const topEnd = Math.max(0, Math.min(H, overlayY));
+  if (topEnd > 0) {
+    const topGrad = ctx.createLinearGradient(0, 0, 0, topEnd);
     topGrad.addColorStop(0, 'rgba(12, 24, 36, 0.2)');
     topGrad.addColorStop(1, 'rgba(12, 24, 36, 0.03)');
     ctx.fillStyle = topGrad;
-    ctx.fillRect(0, 0, W, slotY);
+    ctx.fillRect(0, 0, W, topEnd);
   }
 
   // 4. Bottom signature dark-teal / blue-green cinematic gradient
-  const bottomStart = Math.max(0, slotY + baseH - 2);
+  const bottomStart = Math.max(0, Math.min(H * 0.72, overlayY + overlayH - 2));
   const bottomGrad = ctx.createLinearGradient(0, bottomStart, 0, H);
   bottomGrad.addColorStop(0, 'rgba(13, 66, 76, 0.78)');
   bottomGrad.addColorStop(0.45, 'rgba(7, 46, 56, 0.89)');
@@ -1359,78 +1382,71 @@ function drawAtmosphericCinematicFrame(ctx, sourceVideo, W, H, transform = DEFAU
   ctx.fillStyle = glow;
   ctx.fillRect(0, bottomStart, W, H - bottomStart);
 
-  // 5. Sharp, crisp foreground footage clipped cleanly inside the center frame
-  ctx.save();
-  ctx.beginPath();
-  ctx.rect(slotX, slotY, baseW, baseH);
-  ctx.clip();
-  ctx.filter = 'contrast(1.04) saturate(1.05) brightness(1.01)';
-  ctx.drawImage(sourceVideo, drawX, drawY, zoomedW, zoomedH);
-  ctx.restore();
+  // 5. Sharp, unblurred foreground OVERLAY (expands & shrinks cleanly with Zoom + Sumbu X / Sumbu Y)
+  if (mediaSource) {
+    ctx.save();
+    ctx.filter = 'contrast(1.04) saturate(1.05) brightness(1.01)';
+    ctx.drawImage(mediaSource, overlayX, overlayY, overlayW, overlayH);
+    ctx.restore();
+  }
 
-  // 6. Soft cinematic seam feathering at top & bottom boundaries of center footage
-  const seamHeight = Math.max(6, Math.round(H * 0.008));
-  const topSeam = ctx.createLinearGradient(0, slotY, 0, slotY + seamHeight);
+  // 6. Soft cinematic seam feathering at top & bottom boundaries of the unblurred overlay
+  const seamHeight = Math.max(5, Math.round(H * 0.007));
+  const topSeam = ctx.createLinearGradient(0, overlayY, 0, overlayY + seamHeight);
   topSeam.addColorStop(0, 'rgba(15, 35, 45, 0.25)');
   topSeam.addColorStop(1, 'rgba(15, 35, 45, 0)');
   ctx.fillStyle = topSeam;
-  ctx.fillRect(slotX, slotY, baseW, seamHeight);
+  ctx.fillRect(overlayX, overlayY, overlayW, seamHeight);
 
-  const botSeam = ctx.createLinearGradient(0, slotY + baseH - seamHeight, 0, slotY + baseH);
+  const botSeam = ctx.createLinearGradient(0, overlayY + overlayH - seamHeight, 0, overlayY + overlayH);
   botSeam.addColorStop(0, 'rgba(8, 45, 54, 0)');
   botSeam.addColorStop(1, 'rgba(8, 45, 54, 0.35)');
   ctx.fillStyle = botSeam;
-  ctx.fillRect(slotX, slotY + baseH - seamHeight, baseW, seamHeight);
-}
+  ctx.fillRect(overlayX, overlayY + overlayH - seamHeight, overlayW, seamHeight);
 
-/**
- * Generates an offscreen 16:9 reference scenic canvas (clouds + alpine mountains)
- * so the live style preview works immediately even before a user uploads a video.
- */
-function renderReferenceLandscapeCanvas(offscreenCanvas, timeSec = 0) {
-  const W = offscreenCanvas.width;
-  const H = offscreenCanvas.height;
-  const ctx = offscreenCanvas.getContext('2d');
+  // 7. Interactive overlay bounding guide (shown only in the live style preview editor)
+  if (showOverlayGuide) {
+    ctx.save();
+    const gx = Math.max(1, overlayX);
+    const gy = Math.max(1, overlayY);
+    const gw = Math.min(W - 2, overlayW);
+    const gh = Math.min(H - 2, overlayH);
 
-  const sky = ctx.createLinearGradient(0, 0, 0, H * 0.65);
-  sky.addColorStop(0, '#1e3a8a');
-  sky.addColorStop(0.55, '#60a5fa');
-  sky.addColorStop(1, '#dbeafe');
-  ctx.fillStyle = sky;
-  ctx.fillRect(0, 0, W, H);
+    ctx.strokeStyle = 'rgba(34, 211, 238, 0.78)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(gx, gy, gw, gh);
 
-  ctx.fillStyle = 'rgba(255, 255, 255, 0.72)';
-  for (let i = 0; i < 6; i++) {
-    const cx = ((i * 190 + timeSec * 18) % (W + 220)) - 110;
-    const cy = 48 + (i % 3) * 34;
+    // Corner handles to visually indicate the resizable unblurred overlay layer
+    const handleLen = 10;
+    ctx.strokeStyle = '#22d3ee';
+    ctx.lineWidth = 2.5;
+    // Top-left
     ctx.beginPath();
-    ctx.ellipse(cx, cy, 110, 32, 0, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.moveTo(gx, gy + handleLen);
+    ctx.lineTo(gx, gy);
+    ctx.lineTo(gx + handleLen, gy);
+    ctx.stroke();
+    // Top-right
+    ctx.beginPath();
+    ctx.moveTo(gx + gw - handleLen, gy);
+    ctx.lineTo(gx + gw, gy);
+    ctx.lineTo(gx + gw, gy + handleLen);
+    ctx.stroke();
+    // Bottom-left
+    ctx.beginPath();
+    ctx.moveTo(gx, gy + gh - handleLen);
+    ctx.lineTo(gx, gy + gh);
+    ctx.lineTo(gx + handleLen, gy + gh);
+    ctx.stroke();
+    // Bottom-right
+    ctx.beginPath();
+    ctx.moveTo(gx + gw - handleLen, gy + gh);
+    ctx.lineTo(gx + gw, gy + gh);
+    ctx.lineTo(gx + gw, gy + gh - handleLen);
+    ctx.stroke();
+
+    ctx.restore();
   }
-
-  ctx.fillStyle = '#0f4c5c';
-  ctx.beginPath();
-  ctx.moveTo(0, H);
-  ctx.lineTo(0, H * 0.56);
-  ctx.lineTo(W * 0.22, H * 0.43);
-  ctx.lineTo(W * 0.46, H * 0.54);
-  ctx.lineTo(W * 0.72, H * 0.38);
-  ctx.lineTo(W, H * 0.52);
-  ctx.lineTo(W, H);
-  ctx.closePath();
-  ctx.fill();
-
-  ctx.fillStyle = '#062c36';
-  ctx.beginPath();
-  ctx.moveTo(0, H);
-  ctx.lineTo(0, H * 0.72);
-  ctx.lineTo(W * 0.34, H * 0.54);
-  ctx.lineTo(W * 0.64, H * 0.68);
-  ctx.lineTo(W * 0.88, H * 0.49);
-  ctx.lineTo(W, H * 0.62);
-  ctx.lineTo(W, H);
-  ctx.closePath();
-  ctx.fill();
 }
 
 async function renderAtmosphericCinematicClip({
@@ -1478,7 +1494,7 @@ async function renderAtmosphericCinematicClip({
   canvas.height = H;
   const ctx = canvas.getContext('2d');
 
-  drawAtmosphericCinematicFrame(ctx, video, W, H, transform);
+  drawAtmosphericCinematicFrame(ctx, video, W, H, transform, { showOverlayGuide: false });
   const thumbnailDataUrl = canvas.toDataURL('image/jpeg', 0.86);
 
   const canvasStream = canvas.captureStream(30);
@@ -1585,7 +1601,7 @@ async function renderAtmosphericCinematicClip({
 
     const pumpFrame = () => {
       if (finished) return;
-      drawAtmosphericCinematicFrame(ctx, video, W, H, transform);
+      drawAtmosphericCinematicFrame(ctx, video, W, H, transform, { showOverlayGuide: false });
       const pct = Math.min(100, Math.max(0, ((video.currentTime - safeStart) / clipSpan) * 100));
       if (onFrameProgress) onFrameProgress(pct);
 
@@ -1942,92 +1958,88 @@ function PrecisionTickSlider({ label, value, min, max, step = 1, unit = '%', onC
 }
 
 /**
- * Live 9:16 Style & Framing Preview Canvas + Precision Tick Sliders
+ * Live 9:16 Style & Overlay Framing Preview Canvas + Precision Tick Sliders
+ * Uses the verified YouTube video thumbnail as the style reference so you can
+ * adjust Sumbu X, Sumbu Y, Zoom (overlay scale), and Efek Blur before rendering.
  */
-function LiveStylePreviewEditor({ videoFile, transform, onChangeTransform }) {
+function LiveStylePreviewEditor({ youtubeMeta, transform, onChangeTransform }) {
   const previewCanvasRef = useRef(null);
-  const hiddenVideoRef = useRef(null);
-  const fallbackCanvasRef = useRef(null);
-  const [isPlaying, setIsPlaying] = useState(true);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(10);
-  const [videoObjectUrl, setVideoObjectUrl] = useState(null);
+  const ytThumbImgRef = useRef(null);
+  const [ytThumbReady, setYtThumbReady] = useState(false);
 
+  // Load verified YouTube video thumbnail cleanly (tries maxresdefault 16:9 first, falls back to mqdefault 16:9)
   useEffect(() => {
-    if (!videoFile) {
-      setVideoObjectUrl(null);
-      return;
-    }
-    const url = URL.createObjectURL(videoFile);
-    setVideoObjectUrl(url);
-    return () => URL.revokeObjectURL(url);
-  }, [videoFile]);
+    setYtThumbReady(false);
+    ytThumbImgRef.current = null;
+    if (!youtubeMeta?.videoId && !youtubeMeta?.thumbnailUrl) return;
 
-  useEffect(() => {
-    let rafId = null;
-    const startWall = performance.now();
+    let cancelled = false;
+    const img = new Image();
+    const fallbackUrl = youtubeMeta?.videoId
+      ? `https://i.ytimg.com/vi/${youtubeMeta.videoId}/mqdefault.jpg`
+      : youtubeMeta.thumbnailUrl;
 
-    if (!fallbackCanvasRef.current) {
-      const c = document.createElement('canvas');
-      c.width = 640;
-      c.height = 360;
-      fallbackCanvasRef.current = c;
-    }
-
-    const renderPreviewLoop = () => {
-      const canvas = previewCanvasRef.current;
-      if (canvas) {
-        const ctx = canvas.getContext('2d');
-        const vid = hiddenVideoRef.current;
-        if (videoObjectUrl && vid && vid.readyState >= 2) {
-          drawAtmosphericCinematicFrame(ctx, vid, canvas.width, canvas.height, transform);
-          setCurrentTime(vid.currentTime || 0);
-        } else {
-          const elapsed = isPlaying ? (performance.now() - startWall) / 1000 : 1.5;
-          renderReferenceLandscapeCanvas(fallbackCanvasRef.current, elapsed);
-          drawAtmosphericCinematicFrame(ctx, fallbackCanvasRef.current, canvas.width, canvas.height, transform);
-        }
+    img.onload = () => {
+      if (cancelled) return;
+      // YouTube returns a 120x90 gray placeholder if maxresdefault does not exist
+      if (img.naturalWidth <= 120 && img.src !== fallbackUrl) {
+        img.src = fallbackUrl;
+        return;
       }
-      rafId = requestAnimationFrame(renderPreviewLoop);
+      ytThumbImgRef.current = img;
+      setYtThumbReady(true);
     };
 
-    rafId = requestAnimationFrame(renderPreviewLoop);
+    img.onerror = () => {
+      if (cancelled) return;
+      if (img.src !== fallbackUrl) {
+        img.src = fallbackUrl;
+      } else if (youtubeMeta?.oembedThumbnailUrl && img.src !== youtubeMeta.oembedThumbnailUrl) {
+        img.src = youtubeMeta.oembedThumbnailUrl;
+      }
+    };
+
+    img.src = youtubeMeta?.videoId
+      ? `https://i.ytimg.com/vi/${youtubeMeta.videoId}/maxresdefault.jpg`
+      : youtubeMeta.thumbnailUrl;
+
     return () => {
-      if (rafId) cancelAnimationFrame(rafId);
+      cancelled = true;
+      img.onload = null;
+      img.onerror = null;
     };
-  }, [videoObjectUrl, transform, isPlaying]);
+  }, [youtubeMeta?.videoId, youtubeMeta?.thumbnailUrl, youtubeMeta?.oembedThumbnailUrl]);
 
-  const togglePreviewPlay = () => {
-    const vid = hiddenVideoRef.current;
-    if (videoObjectUrl && vid) {
-      if (vid.paused) {
-        vid.play().then(() => setIsPlaying(true)).catch(() => {});
-      } else {
-        vid.pause();
-        setIsPlaying(false);
-      }
-    } else {
-      setIsPlaying((p) => !p);
-    }
-  };
+  // Redraw the 9:16 preview whenever thumbnail loads or X/Y/Zoom/Blur changes
+  useEffect(() => {
+    const canvas = previewCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const sourceImg = ytThumbReady ? ytThumbImgRef.current : null;
+    drawAtmosphericCinematicFrame(ctx, sourceImg, canvas.width, canvas.height, transform, {
+      showOverlayGuide: Boolean(sourceImg)
+    });
+  }, [ytThumbReady, transform]);
 
   const isModified =
     transform.offsetX !== 0 || transform.offsetY !== 0 || transform.zoom !== 100 || transform.blur !== 100;
 
   return (
     <div className="rounded-xl bg-[#0A0D12] border border-slate-800/90 p-3.5 space-y-3.5">
-      <div className="flex items-center justify-between">
-        <div>
-          <span className="text-xs font-semibold text-white block">Live 9:16 Style & Framing Preview</span>
-          <span className="text-[11px] text-slate-400">
-            {videoFile ? 'Previewing uploaded video in Atmospheric Cinematic preset' : 'Default Atmospheric Cinematic reference preview'}
+      <div className="flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <span className="text-xs font-semibold text-white block">Live 9:16 Style & Overlay Preview</span>
+          <span className="text-[11px] text-slate-400 block truncate">
+            {ytThumbReady
+              ? `YouTube Reference: ${youtubeMeta?.title || 'Verified Video'}`
+              : 'Verify a YouTube URL in Section B to preview thumbnail style'}
           </span>
         </div>
         {isModified && (
           <button
             type="button"
             onClick={() => onChangeTransform({ ...DEFAULT_EDIT_TRANSFORM })}
-            className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-[11px] text-cyan-300 border border-slate-700"
+            className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-[11px] text-cyan-300 border border-slate-700 shrink-0"
           >
             <RotateCcw className="w-3 h-3" />
             Reset
@@ -2035,39 +2047,25 @@ function LiveStylePreviewEditor({ videoFile, transform, onChangeTransform }) {
         )}
       </div>
 
-      {videoObjectUrl && (
-        <video
-          ref={hiddenVideoRef}
-          src={videoObjectUrl}
-          muted
-          loop
-          autoPlay
-          playsInline
-          onLoadedMetadata={(e) => {
-            setDuration(e.currentTarget.duration || 10);
-            e.currentTarget.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
-          }}
-          className="hidden"
-        />
-      )}
-
-      <div className="relative mx-auto w-full max-w-[210px] aspect-[9/16] rounded-xl overflow-hidden border border-cyan-500/35 shadow-2xl bg-[#051820] group">
+      {/* 9:16 Style Reference Canvas (Strictly uses YouTube Thumbnail) */}
+      <div className="relative mx-auto w-full max-w-[225px] aspect-[9/16] rounded-xl overflow-hidden border border-cyan-500/35 shadow-2xl bg-[#051820]">
         <canvas ref={previewCanvasRef} width={360} height={640} className="w-full h-full object-contain block" />
 
-        <button
-          type="button"
-          onClick={togglePreviewPlay}
-          aria-label={isPlaying ? 'Pause live preview' : 'Play live preview'}
-          className="absolute inset-0 flex items-center justify-center bg-black/20 opacity-0 group-hover:opacity-100 focus:opacity-100 transition"
-        >
-          <span className="w-10 h-10 rounded-full bg-cyan-500/90 text-slate-950 flex items-center justify-center shadow-lg">
-            {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4 ml-0.5" />}
-          </span>
-        </button>
+        {!ytThumbReady && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center p-4 text-center pointer-events-none">
+            <div className="w-full aspect-video rounded-lg border border-dashed border-cyan-400/50 bg-slate-900/55 flex flex-col items-center justify-center p-3">
+              <Youtube className="w-6 h-6 text-cyan-400 mb-1.5" />
+              <p className="text-[11px] font-medium text-slate-200">YouTube Thumbnail Reference</p>
+              <p className="text-[10px] text-slate-400 mt-0.5 leading-snug">
+                Paste a YouTube link & click “Verify Video” in Section B to load its thumbnail here
+              </p>
+            </div>
+          </div>
+        )}
 
         <div className="absolute top-2 left-2 right-2 flex items-center justify-between pointer-events-none">
           <span className="px-1.5 py-0.5 rounded bg-black/65 text-[9px] font-mono text-cyan-300 border border-white/10">
-            9:16 LIVE
+            9:16 OVERLAY
           </span>
           <span className="px-1.5 py-0.5 rounded bg-black/65 text-[9px] font-mono text-slate-200 border border-white/10">
             Z:{transform.zoom}% B:{transform.blur}%
@@ -2075,34 +2073,7 @@ function LiveStylePreviewEditor({ videoFile, transform, onChangeTransform }) {
         </div>
       </div>
 
-      {videoObjectUrl && (
-        <div className="flex items-center gap-2 px-1">
-          <button
-            type="button"
-            onClick={togglePreviewPlay}
-            className="p-1.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200"
-            aria-label={isPlaying ? 'Pause' : 'Play'}
-          >
-            {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
-          </button>
-          <input
-            type="range"
-            min={0}
-            max={Math.max(1, duration)}
-            step={0.1}
-            value={currentTime}
-            onChange={(e) => {
-              const t = Number(e.target.value);
-              setCurrentTime(t);
-              if (hiddenVideoRef.current) hiddenVideoRef.current.currentTime = t;
-            }}
-            aria-label="Preview timeline scrubber"
-            className="flex-1 accent-cyan-400 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
-          />
-          <span className="text-[10px] font-mono text-slate-400 shrink-0">{formatTimecode(currentTime)}</span>
-        </div>
-      )}
-
+      {/* Precision Tick Sliders: Sumbu X, Sumbu Y, Zoom (Overlay Scale), Efek Blur */}
       <div className="pt-2 border-t border-slate-800/80 space-y-1">
         <PrecisionTickSlider
           label="Sumbu x"
@@ -2125,8 +2096,8 @@ function LiveStylePreviewEditor({ videoFile, transform, onChangeTransform }) {
         <PrecisionTickSlider
           label="Zoom"
           value={transform.zoom}
-          min={50}
-          max={250}
+          min={30}
+          max={320}
           step={1}
           unit="%"
           onChange={(val) => onChangeTransform((prev) => ({ ...prev, zoom: val }))}
@@ -2537,8 +2508,8 @@ function ClipResultCard({
                   <PrecisionTickSlider
                     label="Zoom"
                     value={clipTransform.zoom}
-                    min={50}
-                    max={250}
+                    min={30}
+                    max={320}
                     onChange={(v) => setClipTransform((p) => ({ ...p, zoom: v }))}
                   />
                   <PrecisionTickSlider
@@ -4080,7 +4051,7 @@ export default function App() {
                       <div>
                         <h2 className="text-sm font-semibold text-white">Section B — Video Source</h2>
                         <p className="text-xs text-slate-400">
-                          Verify YouTube metadata or upload an authorized video file for 9:16 rendering.
+                          Verify YouTube metadata (loads thumbnail preview) & upload an authorized video file for rendering.
                         </p>
                       </div>
                     </div>
@@ -4374,15 +4345,15 @@ export default function App() {
                       <div>
                         <h2 className="text-sm font-semibold text-white">Section D — Video Editing & Clipping</h2>
                         <p className="text-xs text-slate-400">
-                          Configure 9:16 framing, blur, resolution & clip quantity.
+                          Configure 9:16 overlay scale, position, blur & clip quantity.
                         </p>
                       </div>
                     </div>
 
-                    {/* D1. CLIPPING STYLE + LIVE PREVIEW + SUMBU X / Y / ZOOM / BLUR */}
+                    {/* D1. CLIPPING STYLE + YOUTUBE THUMBNAIL PREVIEW + SUMBU X / Y / ZOOM / BLUR */}
                     <div className="space-y-3">
                       <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400">
-                        D1. Clipping Style & Framing Controls
+                        D1. Clipping Style & Overlay Controls
                       </label>
                       {Object.values(CLIPPING_STYLES).map((style) => {
                         const selected = clippingStyle === style.id;
@@ -4413,7 +4384,7 @@ export default function App() {
                       })}
 
                       <LiveStylePreviewEditor
-                        videoFile={videoFile}
+                        youtubeMeta={youtubeMeta}
                         transform={editTransform}
                         onChangeTransform={setEditTransform}
                       />
