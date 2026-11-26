@@ -185,7 +185,7 @@ function parseYouTubeUrl(rawUrl) {
     valid: true,
     videoId,
     canonicalUrl: `https://www.youtube.com/watch?v=${videoId}`,
-    thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`
+    thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`
   };
 }
 
@@ -1312,6 +1312,9 @@ function drawAtmosphericCinematicFrame(
   const zoomFactor = Math.max(0.3, Math.min(3.5, zoomPct / 100));
   const blurPx = Math.max(0, Math.round(34 * (blurPct / 100)));
 
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+
   // 1. Background layer: enlarged cover scale with adjustable atmospheric blur across full 9:16 canvas
   ctx.save();
   const coverScale = Math.max(W / vw, H / vh) * 1.24;
@@ -1445,9 +1448,11 @@ async function renderAtmosphericCinematicClip({
   canvas.width = W;
   canvas.height = H;
   const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
 
   drawAtmosphericCinematicFrame(ctx, video, W, H, transform, { showOverlayGuide: false });
-  const thumbnailDataUrl = canvas.toDataURL('image/jpeg', 0.86);
+  const thumbnailDataUrl = canvas.toDataURL('image/jpeg', 0.92);
 
   const canvasStream = canvas.captureStream(30);
   let combinedStream = canvasStream;
@@ -1477,10 +1482,12 @@ async function renderAtmosphericCinematicClip({
   }
 
   const preferredMimes = [
+    'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+    'video/mp4;codecs=avc1',
+    'video/mp4',
     'video/webm;codecs=vp9,opus',
     'video/webm;codecs=vp8,opus',
-    'video/webm',
-    'video/mp4'
+    'video/webm'
   ];
   const supportedMime =
     preferredMimes.find((m) => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)) || '';
@@ -1489,7 +1496,7 @@ async function renderAtmosphericCinematicClip({
   const recorder = supportedMime
     ? new MediaRecorder(combinedStream, {
         mimeType: supportedMime,
-        videoBitsPerSecond: resolutionKey === '1080p' ? 5000000 : 3000000
+        videoBitsPerSecond: resolutionKey === '1080p' ? 14000000 : 8000000
       })
     : new MediaRecorder(combinedStream);
 
@@ -1498,14 +1505,20 @@ async function renderAtmosphericCinematicClip({
   };
 
   const clipSpan = Math.max(1, safeEnd - safeStart);
-  video.playbackRate = speedMode === 'fast' ? 1.5 : 1.0;
+  video.playbackRate = speedMode === 'fast' ? 1.25 : 1.0;
 
   return new Promise((resolve, reject) => {
-    let timerId = null;
+    let rafId = null;
+    let vfcId = null;
     let finished = false;
 
     const cleanup = () => {
-      if (timerId) clearInterval(timerId);
+      if (rafId) cancelAnimationFrame(rafId);
+      if (vfcId && typeof video.cancelVideoFrameCallback === 'function') {
+        try {
+          video.cancelVideoFrameCallback(vfcId);
+        } catch {}
+      }
       URL.revokeObjectURL(url);
       if (audioCtx) audioCtx.close().catch(() => {});
       video.remove();
@@ -1514,7 +1527,7 @@ async function renderAtmosphericCinematicClip({
     const finishRender = () => {
       if (finished) return;
       finished = true;
-      if (timerId) clearInterval(timerId);
+      if (rafId) cancelAnimationFrame(rafId);
       video.pause();
       if (recorder.state !== 'inactive') {
         try {
@@ -1525,7 +1538,7 @@ async function renderAtmosphericCinematicClip({
     };
 
     recorder.onstop = () => {
-      const mime = recorder.mimeType || supportedMime || 'video/webm';
+      const mime = recorder.mimeType || supportedMime || 'video/mp4';
       const blob = new Blob(chunks, { type: mime });
       cleanup();
       if (!blob || blob.size === 0) {
@@ -1559,15 +1572,20 @@ async function renderAtmosphericCinematicClip({
 
       if (video.currentTime >= safeEnd || video.ended) {
         finishRender();
+        return;
+      }
+      if (typeof video.requestVideoFrameCallback === 'function') {
+        vfcId = video.requestVideoFrameCallback(pumpFrame);
+      } else {
+        rafId = requestAnimationFrame(pumpFrame);
       }
     };
 
-    recorder.start(200);
+    recorder.start(250);
     video
       .play()
       .then(() => {
         pumpFrame();
-        timerId = setInterval(pumpFrame, 1000 / 30);
       })
       .catch((err) => {
         finished = true;
@@ -2082,12 +2100,16 @@ function ClipResultCard({
   briefRules,
   hasVideoFile,
   sourceVideoFile,
+  youtubeVideoId,
+  onUploadVideoForRender,
+  isBatchRendering,
   onUpdateClip,
   onDeleteClip,
   onNotify
 }) {
   const [videoUrl, setVideoUrl] = useState(null);
   const [videoBlobSize, setVideoBlobSize] = useState(0);
+  const [playYouTubeSegment, setPlayYouTubeSegment] = useState(false);
   const [showPreviewModal, setShowPreviewModal] = useState(false);
   const [showTransformEditor, setShowTransformEditor] = useState(false);
   const [clipTransform, setClipTransform] = useState(clip.transform || { ...DEFAULT_EDIT_TRANSFORM });
@@ -2121,10 +2143,11 @@ function ClipResultCard({
     try {
       const blob = await StudioDB.getClipBlob(clip.id);
       if (!blob || blob.size === 0) {
-        onNotify('Video file is not available yet. Upload a source video file to render downloadable clips.', 'error');
+        onNotify('Video MP4 belum tersedia. Upload file video sumber untuk merender MP4.', 'error');
         return;
       }
-      const ext = (blob.type || '').includes('mp4') ? 'mp4' : 'webm';
+      const rawMime = (blob.type || '').toLowerCase();
+      const ext = rawMime.includes('mp4') ? 'mp4' : rawMime.includes('webm') ? 'webm' : 'mp4';
       const filename = `Rank${rank}_${sanitizeFilename(clip.title)}_${clip.resolution}.${ext}`;
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -2375,11 +2398,53 @@ function ClipResultCard({
                   poster={clip.thumbnailDataUrl || undefined}
                   playsInline
                   controls
-                  preload="metadata"
+                  preload="auto"
                   className="w-full h-full object-contain bg-black"
                 />
+              ) : playYouTubeSegment && youtubeVideoId ? (
+                <div className="relative w-full h-full flex items-center justify-center bg-[#06181f]">
+                  {clip.thumbnailDataUrl && (
+                    <img
+                      src={clip.thumbnailDataUrl}
+                      alt=""
+                      aria-hidden="true"
+                      className="absolute inset-0 w-full h-full object-cover blur-2xl scale-125 opacity-65 pointer-events-none"
+                    />
+                  )}
+                  <div className="relative z-10 w-full aspect-video bg-black shadow-2xl">
+                    <iframe
+                      title={`Preview ${clip.title}`}
+                      src={`https://www.youtube.com/embed/${youtubeVideoId}?start=${Math.floor(clip.startTime)}&end=${Math.ceil(clip.endTime)}&autoplay=1&rel=0&playsinline=1`}
+                      allow="autoplay; encrypted-media; picture-in-picture"
+                      allowFullScreen
+                      className="w-full h-full border-0"
+                    />
+                  </div>
+                </div>
               ) : clip.thumbnailDataUrl ? (
-                <img src={clip.thumbnailDataUrl} alt={clip.title} className="w-full h-full object-cover" />
+                <div className="relative w-full h-full flex items-center justify-center bg-[#06181f] overflow-hidden">
+                  <img
+                    src={clip.thumbnailDataUrl}
+                    alt=""
+                    aria-hidden="true"
+                    className="absolute inset-0 w-full h-full object-cover blur-2xl scale-125 opacity-70 pointer-events-none"
+                  />
+                  <img
+                    src={clip.thumbnailDataUrl}
+                    alt={clip.title}
+                    className="relative z-10 w-full max-h-full object-contain shadow-xl"
+                  />
+                  {youtubeVideoId && (
+                    <button
+                      type="button"
+                      onClick={() => setPlayYouTubeSegment(true)}
+                      className="absolute z-20 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-black/75 hover:bg-cyan-500 text-white hover:text-slate-950 border border-white/20 text-xs font-semibold shadow-lg transition"
+                    >
+                      <Play className="w-3.5 h-3.5 fill-current" />
+                      Preview Clip
+                    </button>
+                  )}
+                </div>
               ) : (
                 <div className="w-full h-full flex flex-col items-center justify-center p-4 text-center bg-gradient-to-b from-slate-800/70 via-[#0d424c]/60 to-[#04181f]">
                   <Film className="w-8 h-8 text-cyan-400 mb-2" />
@@ -2390,9 +2455,79 @@ function ClipResultCard({
                   <p className="text-[11px] text-slate-400 mt-2">
                     {hasVideoFile
                       ? 'Video file unavailable in browser storage.'
-                      : 'Upload an authorized video file on Create Clips to render downloadable 9:16 video.'}
+                      : 'Upload your source video file below to render downloadable MP4.'}
                   </p>
                 </div>
+              )}
+
+              {/* Resolution & Style Overlay Pill */}
+              <div className="absolute top-2.5 left-2.5 right-2.5 flex items-center justify-between pointer-events-none z-20">
+                <span className="px-2 py-0.5 rounded bg-black/70 backdrop-blur-sm text-[10px] font-mono text-cyan-300 border border-white/10">
+                  {clip.resolution === '1080p' ? '1080×1920' : '720×1280'}
+                </span>
+                <span className="px-2 py-0.5 rounded bg-black/70 backdrop-blur-sm text-[10px] font-mono text-slate-200 border border-white/10">
+                  {formatDurationBadge(clip.duration)}
+                </span>
+              </div>
+            </div>
+
+            {/* Player Controls, Preview Modal & Download */}
+            <div className="mt-4 space-y-2 max-w-[260px] mx-auto">
+              <div className="flex items-center gap-2">
+                {videoUrl ? (
+                  <button
+                    type="button"
+                    onClick={() => setShowPreviewModal(true)}
+                    className="flex-1 inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs font-medium border border-slate-700 transition"
+                  >
+                    <Eye className="w-3.5 h-3.5 text-cyan-400" />
+                    Preview MP4
+                  </button>
+                ) : youtubeVideoId ? (
+                  <button
+                    type="button"
+                    onClick={() => setPlayYouTubeSegment((v) => !v)}
+                    className="flex-1 inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs font-medium border border-slate-700 transition"
+                  >
+                    <Play className="w-3.5 h-3.5 text-cyan-400" />
+                    {playYouTubeSegment ? 'Stop Preview' : 'Preview Clip'}
+                  </button>
+                ) : null}
+                <button
+                  type="button"
+                  onClick={handleDownloadClip}
+                  disabled={!videoUrl}
+                  className="flex-1 inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-cyan-500 hover:bg-cyan-400 disabled:bg-slate-800 disabled:text-slate-500 text-slate-950 text-xs font-semibold transition"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  {videoBlobSize > 0 ? `Download MP4 (${formatBytes(videoBlobSize)})` : 'Download MP4'}
+                </button>
+              </div>
+
+              {!videoUrl && onUploadVideoForRender && (
+                <label className="w-full inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-teal-500/15 hover:bg-teal-500/25 border border-teal-500/40 text-teal-200 text-[11px] font-semibold cursor-pointer transition">
+                  <input
+                    type="file"
+                    accept="video/mp4,video/webm,video/quicktime,video/*"
+                    disabled={isBatchRendering}
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) onUploadVideoForRender(f);
+                    }}
+                    className="sr-only"
+                  />
+                  {isBatchRendering ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-cyan-400" />
+                      Rendering All MP4 Clips...
+                    </>
+                  ) : (
+                    <>
+                      <Upload className="w-3.5 h-3.5 text-teal-300" />
+                      Upload Video File to Render MP4
+                    </>
+                  )}
+                </label>
               )}
 
               {/* Resolution & Style Overlay Pill */}
@@ -3150,7 +3285,7 @@ export default function App() {
     defaultDuration: 30,
     defaultQuantity: 5,
     geminiModel: DEFAULT_GEMINI_MODEL,
-    renderSpeedMode: 'fast'
+    renderSpeedMode: 'realtime'
   });
 
   const [apiKey, setApiKey] = useState(() => {
@@ -3208,6 +3343,7 @@ export default function App() {
 
   const [activeProject, setActiveProject] = useState(null);
   const [activeClips, setActiveClips] = useState([]);
+  const [batchRenderingResults, setBatchRenderingResults] = useState(false);
 
   const [historyProjects, setHistoryProjects] = useState([]);
   const [historySearch, setHistorySearch] = useState('');
@@ -3699,18 +3835,53 @@ export default function App() {
     notify('Clip removed from project.', 'info');
   };
 
-  const handleOpenHistoryProject = async (projectId) => {
+  const handleBatchRenderFromResults = async (file) => {
+    if (!file || !activeProject || activeClips.length === 0) return;
+    setBatchRenderingResults(true);
     try {
-      const result = await StudioDB.getProjectById(projectId);
-      if (!result) {
-        notify('Project could not be found in storage.', 'error');
-        return;
+      const meta = await inspectVideoFile(file);
+      setVideoFile(file);
+      setVideoMeta(meta);
+
+      const resKey = activeProject.settings?.resolution || resolution || '720p';
+      const transformToUse = activeProject.settings?.transform || editTransform || DEFAULT_EDIT_TRANSFORM;
+      const updatedClips = [];
+      const blobsMap = {};
+
+      for (let i = 0; i < activeClips.length; i++) {
+        const clip = activeClips[i];
+        notify(`Rendering MP4 Clip #${i + 1} of ${activeClips.length}...`, 'info');
+        const rendered = await renderAtmosphericCinematicClip({
+          file,
+          startTime: clip.startTime,
+          endTime: clip.endTime,
+          resolutionKey: resKey,
+          speedMode: appSettings.renderSpeedMode || 'realtime',
+          transform: transformToUse
+        });
+        blobsMap[clip.id] = rendered.blob;
+        updatedClips.push({
+          ...clip,
+          thumbnailDataUrl: rendered.thumbnailDataUrl,
+          renderedMimeType: rendered.mimeType,
+          renderedVersion: (clip.renderedVersion || 1) + 1
+        });
       }
-      setActiveProject(result.project);
-      setActiveClips(result.clips);
-      setActivePage('results');
-    } catch {
-      notify('Failed to load project from database.', 'error');
+
+      const updatedProj = {
+        ...activeProject,
+        sourceType: 'uploaded_video',
+        thumbnailDataUrl: updatedClips[0]?.thumbnailDataUrl || activeProject.thumbnailDataUrl
+      };
+      await StudioDB.saveProjectWithClips(updatedProj, updatedClips, blobsMap);
+      setActiveProject(updatedProj);
+      setActiveClips(updatedClips);
+      await refreshHistoryAndStats();
+      notify(`Semua ${updatedClips.length} klip MP4 berhasil dirender dan siap didownload!`, 'success');
+    } catch (err) {
+      notify(err.message || 'Gagal merender klip MP4.', 'error');
+    } finally {
+      setBatchRenderingResults(false);
     }
   };
 
@@ -4711,6 +4882,9 @@ export default function App() {
                         briefRules={activeProject.briefRules}
                         hasVideoFile={activeProject.sourceType === 'uploaded_video'}
                         sourceVideoFile={videoFile}
+                        youtubeVideoId={activeProject.youtubeVideoId}
+                        onUploadVideoForRender={handleBatchRenderFromResults}
+                        isBatchRendering={batchRenderingResults}
                         onUpdateClip={handleUpdateClip}
                         onDeleteClip={handleDeleteClip}
                         onNotify={notify}
