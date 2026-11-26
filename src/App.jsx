@@ -12,7 +12,6 @@ import {
   FileText,
   Sliders,
   Play,
-  Pause,
   Download,
   Copy,
   Check,
@@ -55,7 +54,7 @@ const CLIPPING_STYLES = {
     badge: 'Default Preset',
     aspectRatio: '9:16',
     description:
-      'Vertical 9:16 composition with a resizable sharp foreground overlay, enlarged soft-blurred top sky extension, and a deep dark-teal cinematic gradient atmosphere below.'
+      'Vertical 9:16 composition with a resizable sharp foreground overlay over a full-bleed soft-blurred atmospheric background.'
   }
 };
 
@@ -72,8 +71,21 @@ const RESOLUTIONS = {
 };
 
 const DURATIONS = [
-  { value: 30, label: '30 seconds', hint: 'Target max ~30s (natural sentence boundaries)' },
-  { value: 60, label: '60 seconds', hint: 'Target max ~60s (storytelling arc preserved)' }
+  {
+    value: 'context',
+    label: 'Sesuaikan Konteks Klip',
+    hint: 'Otomatis 15–90d mengikuti alur cerita & konteks utuh'
+  },
+  {
+    value: 30,
+    label: '30 seconds',
+    hint: 'Target max ~30s (natural sentence boundaries)'
+  },
+  {
+    value: 60,
+    label: '60 seconds',
+    hint: 'Target max ~60s (storytelling arc preserved)'
+  }
 ];
 
 const QUANTITIES = [
@@ -87,11 +99,11 @@ const QUANTITIES = [
 const PIPELINE_STEPS = [
   { id: 1, key: 'validating', title: 'Validating Video', desc: 'Verifying source stream, dimensions, and timeline integrity' },
   { id: 2, key: 'brief', title: 'Reading Campaign Brief', desc: 'Extracting campaign objectives, rules, tone, and restrictions' },
-  { id: 3, key: 'analyzing', title: 'Analyzing Video Content', desc: 'Sampling visual keyframes and timeline context across segments' },
+  { id: 3, key: 'analyzing', title: 'Analyzing Video Content', desc: 'Sampling timestamped visual frames & audio context across timeline' },
   { id: 4, key: 'detecting', title: 'Detecting High-Potential Moments', desc: 'Running Gemini multimodal viral & storytelling analysis' },
   { id: 5, key: 'ranking', title: 'Ranking Candidate Clips', desc: 'Validating boundaries, removing overlaps, and scoring retention' },
   { id: 6, key: 'content', title: 'Generating Hooks & Content', desc: 'Crafting Indonesian hooks, headlines, captions, CTAs & compliance audit' },
-  { id: 7, key: 'rendering', title: 'Rendering Videos', desc: 'Compositing 9:16 Atmospheric Cinematic clips & thumbnails' },
+  { id: 7, key: 'rendering', title: 'Rendering Videos', desc: 'Compositing smooth 9:16 MP4 clips & thumbnails' },
   { id: 8, key: 'qa', title: 'Final Quality Check', desc: 'Verifying rendered output streams and brief compliance scores' },
   { id: 9, key: 'saving', title: 'Saving Project', desc: 'Persisting project, metadata, and media assets to database' }
 ];
@@ -189,6 +201,92 @@ function parseYouTubeUrl(rawUrl) {
   };
 }
 
+/**
+ * Probes real YouTube video duration via official YouTube IFrame Player API
+ * so long podcasts (e.g. 30-90 mins) are never truncated to 3 minutes.
+ */
+function probeYouTubeDurationViaIframe(videoId, timeoutMs = 6500) {
+  return new Promise((resolve) => {
+    if (typeof window === 'undefined' || !videoId) {
+      resolve(null);
+      return;
+    }
+
+    let settled = false;
+    let hostDiv = null;
+    let player = null;
+
+    const cleanup = () => {
+      try {
+        if (player && typeof player.destroy === 'function') player.destroy();
+      } catch {}
+      if (hostDiv && hostDiv.parentNode) {
+        hostDiv.parentNode.removeChild(hostDiv);
+      }
+    };
+
+    const finish = (dur) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(Number.isFinite(dur) && dur > 0 ? dur : null);
+    };
+
+    const timer = setTimeout(() => finish(null), timeoutMs);
+
+    const initPlayer = () => {
+      try {
+        hostDiv = document.createElement('div');
+        hostDiv.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
+        const innerId = `yt_probe_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        hostDiv.innerHTML = `<div id="${innerId}"></div>`;
+        document.body.appendChild(hostDiv);
+
+        player = new window.YT.Player(innerId, {
+          videoId,
+          width: 1,
+          height: 1,
+          playerVars: { autoplay: 0, controls: 0, playsinline: 1 },
+          events: {
+            onReady: (ev) => {
+              const d = ev?.target?.getDuration ? ev.target.getDuration() : 0;
+              clearTimeout(timer);
+              finish(d > 0 ? d : null);
+            },
+            onError: () => {
+              clearTimeout(timer);
+              finish(null);
+            }
+          }
+        });
+      } catch {
+        clearTimeout(timer);
+        finish(null);
+      }
+    };
+
+    if (window.YT && window.YT.Player) {
+      initPlayer();
+    } else {
+      const prevReady = window.onYouTubeIframeAPIReady;
+      window.onYouTubeIframeAPIReady = () => {
+        if (typeof prevReady === 'function') {
+          try {
+            prevReady();
+          } catch {}
+        }
+        initPlayer();
+      };
+      if (!document.querySelector('script[src*="youtube.com/iframe_api"]')) {
+        const tag = document.createElement('script');
+        tag.src = 'https://www.youtube.com/iframe_api';
+        tag.async = true;
+        document.head.appendChild(tag);
+      }
+    }
+  });
+}
+
 async function verifyYouTubeMetadata(rawUrl) {
   const parsed = parseYouTubeUrl(rawUrl);
   if (!parsed.valid) {
@@ -200,7 +298,10 @@ async function verifyYouTubeMetadata(rawUrl) {
   const timeout = setTimeout(() => controller.abort(), 10000);
 
   try {
-    const res = await fetch(oembedUrl, { signal: controller.signal });
+    const [res, probedDuration] = await Promise.all([
+      fetch(oembedUrl, { signal: controller.signal }),
+      probeYouTubeDurationViaIframe(parsed.videoId)
+    ]);
     clearTimeout(timeout);
     if (!res.ok) {
       if (res.status === 401 || res.status === 403) {
@@ -220,6 +321,7 @@ async function verifyYouTubeMetadata(rawUrl) {
       channelUrl: data.author_url || '',
       thumbnailUrl: parsed.thumbnailUrl,
       oembedThumbnailUrl: data.thumbnail_url || parsed.thumbnailUrl,
+      durationSeconds: probedDuration || null,
       width: data.width || 1280,
       height: data.height || 720,
       verifiedAt: new Date().toISOString()
@@ -396,11 +498,9 @@ const StudioDB = {
             projectId: project.id,
             buffer,
             size: blob.size,
-            mimeType: blob.type || 'video/webm'
+            mimeType: blob.type || 'video/mp4'
           });
-        } catch {
-          // Keep in memory cache if ArrayBuffer serialization is restricted
-        }
+        } catch {}
       }
     }
 
@@ -435,7 +535,7 @@ const StudioDB = {
         projectId,
         buffer,
         size: blob.size,
-        mimeType: blob.type || 'video/webm'
+        mimeType: blob.type || 'video/mp4'
       });
       tx.oncomplete = () => resolve(true);
       tx.onerror = () => reject(tx.error);
@@ -497,7 +597,7 @@ const StudioDB = {
           return;
         }
         if (res.buffer) {
-          const reconstructed = new Blob([res.buffer], { type: res.mimeType || 'video/webm' });
+          const reconstructed = new Blob([res.buffer], { type: res.mimeType || 'video/mp4' });
           MEMORY_BLOB_CACHE.set(clipId, reconstructed);
           resolve(reconstructed);
           return;
@@ -571,20 +671,20 @@ const StudioDB = {
           req.result || {
             id: 'app_defaults',
             defaultResolution: '720p',
-            defaultDuration: 30,
+            defaultDuration: 'context',
             defaultQuantity: 5,
             geminiModel: DEFAULT_GEMINI_MODEL,
-            renderSpeedMode: 'fast'
+            renderSpeedMode: 'realtime'
           }
         );
       req.onerror = () =>
         resolve({
           id: 'app_defaults',
           defaultResolution: '720p',
-          defaultDuration: 30,
+          defaultDuration: 'context',
           defaultQuantity: 5,
           geminiModel: DEFAULT_GEMINI_MODEL,
-          renderSpeedMode: 'fast'
+          renderSpeedMode: 'realtime'
         });
     });
   },
@@ -636,11 +736,22 @@ const StudioDB = {
 
 /**
  * ============================================================================
- * GOOGLE GEMINI AI SERVICE (STRUCTURED SCHEMAS, RETRY BACKOFF, VALIDATION)
+ * GOOGLE GEMINI AI SERVICE (MULTIMODAL VIDEO + KEYFRAMES, STRUCTURED SCHEMAS)
  * ============================================================================
  */
 
-async function fetchGeminiWithBackoff(apiKey, model, payload, maxRetries = 3, timeoutMs = 45000) {
+async function fileToBase64(file) {
+  const buffer = await file.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+async function fetchGeminiWithBackoff(apiKey, model, payload, maxRetries = 3, timeoutMs = 60000) {
   if (!apiKey || !apiKey.trim()) {
     throw new Error('Gemini API key is required.');
   }
@@ -668,7 +779,7 @@ async function fetchGeminiWithBackoff(apiKey, model, payload, maxRetries = 3, ti
           throw new Error(msg.replace(/key=[^&\s]+/gi, 'key=[REDACTED]'));
         }
         if ((status === 429 || status >= 500) && attempt < maxRetries) {
-          const delay = Math.pow(2, attempt) * 1200;
+          const delay = Math.pow(2, attempt) * 1400;
           await new Promise((r) => setTimeout(r, delay));
           continue;
         }
@@ -689,7 +800,7 @@ async function fetchGeminiWithBackoff(apiKey, model, payload, maxRetries = 3, ti
         lastError = new Error((err.message || 'AI connection error').replace(/key=[^&\s]+/gi, 'key=[REDACTED]'));
       }
       if (attempt < maxRetries && !lastError.message.toLowerCase().includes('api key')) {
-        await new Promise((r) => setTimeout(r, Math.pow(2, attempt) * 1200));
+        await new Promise((r) => setTimeout(r, Math.pow(2, attempt) * 1400));
         continue;
       }
       throw lastError;
@@ -776,6 +887,8 @@ ${briefText || '(See attached PDF document)'}`
     model,
     videoTitle,
     videoDuration,
+    knownDuration,
+    directVideoPayload,
     keyframes,
     briefRules,
     rawBriefText,
@@ -785,6 +898,7 @@ ${briefText || '(See attached PDF document)'}`
     transcriptOrNotes
   }) {
     const desiredCount = requestedQuantity === 'max' ? 12 : Number(requestedQuantity) || 5;
+    const isContextDuration = targetDuration === 'context';
     const parts = [];
 
     if (pdfBase64) {
@@ -796,12 +910,22 @@ ${briefText || '(See attached PDF document)'}`
       });
     }
 
-    if (Array.isArray(keyframes) && keyframes.length > 0) {
+    if (directVideoPayload?.base64) {
       parts.push({
-        text: `Here are ${keyframes.length} chronological visual frames sampled from the video "${videoTitle}" (total duration: ${videoDuration.toFixed(1)}s):`
+        text: `Full source video file "${videoTitle}" (exact duration: ${videoDuration.toFixed(1)}s). Listen closely to all spoken Indonesian/English dialogue, visual actions, product demos, reactions, and exact timestamps:`
+      });
+      parts.push({
+        inlineData: {
+          mimeType: directVideoPayload.mimeType || 'video/mp4',
+          data: directVideoPayload.base64
+        }
+      });
+    } else if (Array.isArray(keyframes) && keyframes.length > 0) {
+      parts.push({
+        text: `Here are ${keyframes.length} chronological visual frames sampled from the video "${videoTitle}" (exact total duration: ${videoDuration.toFixed(1)}s). Each frame displays its exact timeline timestamp:`
       });
       for (const kf of keyframes) {
-        parts.push({ text: `[Timestamp: ${kf.time.toFixed(1)}s]` });
+        parts.push({ text: `[Exact Frame Timestamp: ${kf.time.toFixed(1)}s (${formatTimecode(kf.time)})]` });
         parts.push({
           inlineData: {
             mimeType: 'image/jpeg',
@@ -811,18 +935,35 @@ ${briefText || '(See attached PDF document)'}`
       }
     }
 
-    const promptText = `Analyze the video "${videoTitle}" (duration: ${videoDuration.toFixed(1)} seconds) and identify up to ${desiredCount} distinct, high-potential short-form viral moments.
+    const durationBoundaryInstruction = knownDuration
+      ? `The video has an exact total duration of ${videoDuration.toFixed(1)} seconds. Every startTime MUST be >= 0 and every endTime MUST be <= ${videoDuration.toFixed(1)}.`
+      : `Estimate realistic, well-spaced timestamps along the full video timeline (startTime >= 0).`;
 
-TARGET CLIP DURATION: Max ~${targetDuration} seconds (allow shorter clips if natural storytelling boundaries end earlier; NEVER pad weak moments; NEVER cut off sentences/actions abruptly; NEVER create overlapping or duplicate moments).
-REQUESTED QUANTITY: ${requestedQuantity === 'max' ? 'Maximum high-quality non-overlapping moments supported by the footage' : `${desiredCount} clips (return fewer if the video does not contain ${desiredCount} genuinely distinct high-quality moments, and explain in quantityNote)`}.
+    const clipLengthInstruction = isContextDuration
+      ? `TARGET CLIP DURATION: SESUAIKAN KONTEKS KLIP (Context-Adaptive Duration between 15 seconds and 90 seconds). Automatically determine each clip's startTime and endTime based on the complete narrative context, dialogue setup, punchline, or product demonstration so no sentence or context is cut mid-thought.`
+      : `TARGET CLIP DURATION: Max ~${targetDuration} seconds (between 12s and ${Number(targetDuration) + 5}s). Allow shorter clips if natural sentence/story boundaries finish earlier; NEVER pad weak moments; NEVER cut off sentences or reactions abruptly.`;
+
+    const promptText = `Analyze the video "${videoTitle}" and extract ${
+      requestedQuantity === 'max'
+        ? 'the maximum number of distinct, high-potential non-overlapping viral moments'
+        : `EXACTLY ${desiredCount} distinct, high-potential non-overlapping short-form viral moments (unless the video is physically too short to fit ${desiredCount} non-overlapping segments)`
+    }.
+
+${durationBoundaryInstruction}
+${clipLengthInstruction}
+
+CRITICAL TIMELINE & QUANTITY RULES:
+- You MUST return ${requestedQuantity === 'max' ? 'all strong distinct' : desiredCount} SEPARATE moments from DIFFERENT parts of the video timeline.
+- NEVER stack multiple clips on the same timestamp range! Each clip must cover a completely distinct scene, topic, or creative angle from the brief.
+- Align each clip directly with the actual visual/audio evidence in the video and the Campaign Brief angles.
 
 CAMPAIGN BRIEF (PRIMARY SOURCE OF TRUTH):
 ${JSON.stringify(briefRules, null, 2)}
 Raw Brief Notes: ${rawBriefText || 'None'}
-Additional Video Context / Transcript Notes: ${transcriptOrNotes || 'Analyze directly from visual frames and video metadata.'}
+Additional Video Context / Transcript Notes: ${transcriptOrNotes || 'Analyze directly from the video/frames and metadata.'}
 
-MANDATORY RULES FOR EVERY CLIP:
-1. Timestamps: startTime >= 0, endTime <= ${videoDuration.toFixed(1)}, endTime - startTime >= 6 seconds and <= ${Math.max(targetDuration + 5, 65)} seconds.
+MANDATORY OUTPUT RULES FOR EVERY CLIP:
+1. SCORES MUST BE INTEGER PERCENTAGES FROM 0 TO 100 (e.g., 88, 92, 95 — NEVER use a 1-10 scale!).
 2. HOOKS (Generate 3 distinct options in NATURAL INDONESIAN):
    Each hook MUST combine:
    - Pattern Interrupt (unexpected, surprising, or scroll-stopping opening)
@@ -845,13 +986,13 @@ MANDATORY RULES FOR EVERY CLIP:
       systemInstruction: {
         parts: [
           {
-            text: 'You are an elite Viral Video Producer, Retention Analyst, and Indonesian Content Strategist. Return strictly valid JSON matching the schema. Never fabricate claims or usernames.'
+            text: 'You are an elite Viral Video Producer, Retention Analyst, and Indonesian Content Strategist. Return strictly valid JSON matching the schema. All scores MUST be on a 0-100 scale. Never fabricate claims or usernames.'
           }
         ]
       },
       generationConfig: {
         responseMimeType: 'application/json',
-        temperature: 0.45,
+        temperature: 0.4,
         responseSchema: {
           type: 'OBJECT',
           properties: {
@@ -861,8 +1002,8 @@ MANDATORY RULES FOR EVERY CLIP:
               items: {
                 type: 'OBJECT',
                 properties: {
-                  startTime: { type: 'NUMBER' },
-                  endTime: { type: 'NUMBER' },
+                  startTime: { type: 'NUMBER', description: 'Clip start time in seconds' },
+                  endTime: { type: 'NUMBER', description: 'Clip end time in seconds' },
                   title: { type: 'STRING' },
                   summary: { type: 'STRING' },
                   reason: { type: 'STRING' },
@@ -907,11 +1048,11 @@ MANDATORY RULES FOR EVERY CLIP:
                       required: ['name', 'context', 'verified']
                     }
                   },
-                  viralScore: { type: 'NUMBER' },
-                  retentionScore: { type: 'NUMBER' },
-                  contentQualityScore: { type: 'NUMBER' },
-                  campaignRelevanceScore: { type: 'NUMBER' },
-                  complianceScore: { type: 'NUMBER' },
+                  viralScore: { type: 'NUMBER', description: 'Integer score 0 to 100' },
+                  retentionScore: { type: 'NUMBER', description: 'Integer score 0 to 100' },
+                  contentQualityScore: { type: 'NUMBER', description: 'Integer score 0 to 100' },
+                  campaignRelevanceScore: { type: 'NUMBER', description: 'Integer score 0 to 100' },
+                  complianceScore: { type: 'NUMBER', description: 'Integer score 0 to 100' },
                   scoreExplanation: { type: 'STRING' },
                   passedRequirements: { type: 'ARRAY', items: { type: 'STRING' } },
                   warnings: { type: 'ARRAY', items: { type: 'STRING' } },
@@ -948,7 +1089,7 @@ MANDATORY RULES FOR EVERY CLIP:
       }
     };
 
-    const raw = await fetchGeminiWithBackoff(apiKey, model, payload, 2, 60000);
+    const raw = await fetchGeminiWithBackoff(apiKey, model, payload, 2, 75000);
     return JSON.parse(raw);
   },
 
@@ -1045,39 +1186,51 @@ Avoid repeating previous options.`
 
 function clampScore(val) {
   const n = Number(val);
-  if (!Number.isFinite(n)) return 75;
-  return Math.max(0, Math.min(100, Math.round(n)));
+  if (!Number.isFinite(n)) return 80;
+  // Normalize 1-10 scale if Gemini ever outputs single-digit scores
+  const normalized = n > 0 && n <= 10 ? n * 10 : n;
+  return Math.max(0, Math.min(100, Math.round(normalized)));
 }
 
-function validateAndRankMoments(rawMoments, videoDuration, targetDuration, requestedQuantity) {
-  const safeDuration = Math.max(10, Number(videoDuration) || 60);
-  const maxClipLen = Math.max(12, Number(targetDuration) || 30);
+function validateAndRankMoments(rawMoments, videoDuration, targetDuration, requestedQuantity, knownDuration = true) {
+  const maxAiEnd = (rawMoments || []).reduce((acc, m) => Math.max(acc, Number(m?.endTime) || 0), 0);
+  const safeDuration = knownDuration
+    ? Math.max(10, Number(videoDuration) || 60)
+    : Math.max(Number(videoDuration) || 180, maxAiEnd + 15);
+
+  const isContextMode = targetDuration === 'context';
+  const maxClipLen = isContextMode ? 95 : Math.max(12, Number(targetDuration) || 30);
+  const defaultLen = isContextMode ? 38 : Math.min(maxClipLen, 30);
   const maxCount = requestedQuantity === 'max' ? 15 : Number(requestedQuantity) || 5;
 
   const cleaned = [];
 
   for (const m of rawMoments || []) {
     let start = Math.max(0, Number(m.startTime) || 0);
-    let end = Math.min(safeDuration, Number(m.endTime) || start + Math.min(maxClipLen, safeDuration));
+    let end = Math.min(safeDuration, Number(m.endTime) || start + Math.min(defaultLen, safeDuration));
 
     if (end <= start) {
-      end = Math.min(safeDuration, start + Math.min(maxClipLen, 15));
+      end = Math.min(safeDuration, start + Math.min(defaultLen, 20));
     }
-    if (end - start > maxClipLen + 4) {
+    if (end - start > maxClipLen + 5) {
       end = start + maxClipLen;
     }
-    if (end - start < 4) {
-      if (start + 6 <= safeDuration) end = start + 6;
-      else start = Math.max(0, end - 6);
+    if (end - start < 6) {
+      if (start + Math.min(defaultLen, 15) <= safeDuration) {
+        end = start + Math.min(defaultLen, 15);
+      } else {
+        start = Math.max(0, end - Math.min(defaultLen, 15));
+      }
     }
-    if (end - start < 3) continue;
+    if (end - start < 4) continue;
 
+    // Only reject if two moments overlap by more than 55% of the shorter clip
     const hasHeavyOverlap = cleaned.some((existing) => {
       const overlapStart = Math.max(existing.startTime, start);
       const overlapEnd = Math.min(existing.endTime, end);
       const overlap = Math.max(0, overlapEnd - overlapStart);
       const minLen = Math.min(existing.endTime - existing.startTime, end - start);
-      return minLen > 0 && overlap / minLen > 0.35;
+      return minLen > 0 && overlap / minLen > 0.55;
     });
     if (hasHeavyOverlap) continue;
 
@@ -1230,7 +1383,7 @@ function inspectVideoFile(file) {
   });
 }
 
-async function extractTimelineKeyframes(file, duration, desiredFrameCount = 12) {
+async function extractTimelineKeyframes(file, duration, desiredFrameCount = 24) {
   const url = URL.createObjectURL(file);
   const video = document.createElement('video');
   video.muted = true;
@@ -1243,28 +1396,40 @@ async function extractTimelineKeyframes(file, duration, desiredFrameCount = 12) 
     video.onerror = () => reject(new Error('Failed to decode video frames for AI analysis.'));
   });
 
-  const count = Math.min(desiredFrameCount, Math.max(4, Math.floor(duration / 2.5)));
+  const count = Math.min(desiredFrameCount, Math.max(6, Math.floor(duration / 2)));
   const canvas = document.createElement('canvas');
-  const scaleW = 448;
+  const scaleW = 512;
   const scaleH = Math.round((scaleW * (video.videoHeight || 720)) / (video.videoWidth || 1280));
   canvas.width = scaleW;
-  canvas.height = Math.max(200, scaleH);
+  canvas.height = Math.max(220, scaleH);
   const ctx = canvas.getContext('2d');
 
   const keyframes = [];
   for (let i = 0; i < count; i++) {
     const targetTime = Math.min(duration - 0.2, Math.max(0.1, ((i + 0.5) / count) * duration));
     await new Promise((resolve) => {
+      let settled = false;
       const onSeeked = () => {
+        if (settled) return;
+        settled = true;
         video.removeEventListener('seeked', onSeeked);
         resolve();
       };
       video.addEventListener('seeked', onSeeked);
       video.currentTime = targetTime;
+      setTimeout(onSeeked, 900);
     });
 
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.72);
+
+    // Burn exact timecode badge onto analysis frame so Gemini reads exact timestamps & subtitles clearly
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.72)';
+    ctx.fillRect(8, 8, 154, 24);
+    ctx.fillStyle = '#38bdf8';
+    ctx.font = 'bold 13px monospace';
+    ctx.fillText(`TIME ${formatTimecode(targetTime)}`, 14, 24);
+
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.78);
     keyframes.push({
       time: targetTime,
       base64: dataUrl.split(',')[1]
@@ -1371,7 +1536,6 @@ function drawAtmosphericCinematicFrame(
     ctx.lineWidth = 1.5;
     ctx.strokeRect(gx, gy, gw, gh);
 
-    // Corner handles to visually indicate the resizable unblurred overlay layer
     const handleLen = 10;
     ctx.strokeStyle = '#22d3ee';
     ctx.lineWidth = 2.5;
@@ -1409,7 +1573,7 @@ async function renderAtmosphericCinematicClip({
   startTime,
   endTime,
   resolutionKey = '720p',
-  speedMode = 'fast',
+  speedMode = 'realtime',
   transform = DEFAULT_EDIT_TRANSFORM,
   onFrameProgress
 }) {
@@ -1937,7 +2101,6 @@ function LiveStylePreviewEditor({ youtubeMeta, transform, onChangeTransform }) {
   const ytThumbImgRef = useRef(null);
   const [ytThumbReady, setYtThumbReady] = useState(false);
 
-  // Load verified YouTube video thumbnail cleanly (tries maxresdefault 16:9 first, falls back to mqdefault 16:9)
   useEffect(() => {
     setYtThumbReady(false);
     ytThumbImgRef.current = null;
@@ -1951,7 +2114,6 @@ function LiveStylePreviewEditor({ youtubeMeta, transform, onChangeTransform }) {
 
     img.onload = () => {
       if (cancelled) return;
-      // YouTube returns a 120x90 gray placeholder if maxresdefault does not exist
       if (img.naturalWidth <= 120 && img.src !== fallbackUrl) {
         img.src = fallbackUrl;
         return;
@@ -1980,7 +2142,6 @@ function LiveStylePreviewEditor({ youtubeMeta, transform, onChangeTransform }) {
     };
   }, [youtubeMeta?.videoId, youtubeMeta?.thumbnailUrl, youtubeMeta?.oembedThumbnailUrl]);
 
-  // Redraw the 9:16 preview whenever thumbnail loads or X/Y/Zoom/Blur changes
   useEffect(() => {
     const canvas = previewCanvasRef.current;
     if (!canvas) return;
@@ -2178,7 +2339,7 @@ function ClipResultCard({
         startTime: clip.startTime,
         endTime: clip.endTime,
         resolutionKey: clip.resolution || '720p',
-        speedMode: 'fast',
+        speedMode: 'realtime',
         transform: clipTransform
       });
       await StudioDB.saveSingleClipBlob(clip.id, clip.projectId, rendered.blob);
@@ -2460,7 +2621,7 @@ function ClipResultCard({
                 </div>
               )}
 
-              {/* Resolution & Style Overlay Pill */}
+              {/* Resolution & Duration Overlay Pill */}
               <div className="absolute top-2.5 left-2.5 right-2.5 flex items-center justify-between pointer-events-none z-20">
                 <span className="px-2 py-0.5 rounded bg-black/70 backdrop-blur-sm text-[10px] font-mono text-cyan-300 border border-white/10">
                   {clip.resolution === '1080p' ? '1080×1920' : '720×1280'}
@@ -2493,6 +2654,7 @@ function ClipResultCard({
                     {playYouTubeSegment ? 'Stop Preview' : 'Preview Clip'}
                   </button>
                 ) : null}
+
                 <button
                   type="button"
                   onClick={handleDownloadClip}
@@ -2529,41 +2691,6 @@ function ClipResultCard({
                   )}
                 </label>
               )}
-
-              {/* Resolution & Style Overlay Pill */}
-              <div className="absolute top-2.5 left-2.5 right-2.5 flex items-center justify-between pointer-events-none">
-                <span className="px-2 py-0.5 rounded bg-black/70 backdrop-blur-sm text-[10px] font-mono text-cyan-300 border border-white/10">
-                  {clip.resolution === '1080p' ? '1080×1920' : '720×1280'}
-                </span>
-                <span className="px-2 py-0.5 rounded bg-black/70 backdrop-blur-sm text-[10px] font-mono text-slate-200 border border-white/10">
-                  {formatDurationBadge(clip.duration)}
-                </span>
-              </div>
-            </div>
-
-            {/* Player Controls, Preview Modal & Download */}
-            <div className="mt-4 space-y-2 max-w-[260px] mx-auto">
-              <div className="flex items-center gap-2">
-                {videoUrl && (
-                  <button
-                    type="button"
-                    onClick={() => setShowPreviewModal(true)}
-                    className="flex-1 inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs font-medium border border-slate-700 transition"
-                  >
-                    <Eye className="w-3.5 h-3.5 text-cyan-400" />
-                    Preview
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={handleDownloadClip}
-                  disabled={!videoUrl}
-                  className="flex-1 inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-cyan-500 hover:bg-cyan-400 disabled:bg-slate-800 disabled:text-slate-500 text-slate-950 text-xs font-semibold transition"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  {videoBlobSize > 0 ? `Download (${formatBytes(videoBlobSize)})` : 'Download'}
-                </button>
-              </div>
 
               {sourceVideoFile && (
                 <button
@@ -2618,7 +2745,7 @@ function ClipResultCard({
                         Re-rendering Clip...
                       </>
                     ) : (
-                      'Apply & Re-render Video'
+                      'Apply & Re-render MP4'
                     )}
                   </button>
                 </div>
@@ -2642,7 +2769,7 @@ function ClipResultCard({
                 <div className="flex items-center justify-between gap-2">
                   <div className="min-w-0">
                     <span className="text-[11px] font-mono text-cyan-400">
-                      PREVIEW • {clip.resolution === '1080p' ? '1080×1920' : '720×1280'}
+                      PREVIEW MP4 • {clip.resolution === '1080p' ? '1080×1920' : '720×1280'}
                     </span>
                     <h4 className="text-sm font-semibold text-white truncate">{clip.title}</h4>
                   </div>
@@ -2681,7 +2808,7 @@ function ClipResultCard({
                     className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-bold"
                   >
                     <Download className="w-3.5 h-3.5" />
-                    Download Video
+                    Download MP4
                   </button>
                 </div>
               </div>
@@ -3282,7 +3409,7 @@ export default function App() {
 
   const [appSettings, setAppSettings] = useState({
     defaultResolution: '720p',
-    defaultDuration: 30,
+    defaultDuration: 'context',
     defaultQuantity: 5,
     geminiModel: DEFAULT_GEMINI_MODEL,
     renderSpeedMode: 'realtime'
@@ -3321,7 +3448,7 @@ export default function App() {
   const [clippingStyle, setClippingStyle] = useState('atmospheric-cinematic');
   const [editTransform, setEditTransform] = useState({ ...DEFAULT_EDIT_TRANSFORM });
   const [resolution, setResolution] = useState('720p');
-  const [targetDuration, setTargetDuration] = useState(30);
+  const [targetDuration, setTargetDuration] = useState('context');
   const [clipQuantity, setClipQuantity] = useState(5);
 
   const [jobState, setJobState] = useState({
@@ -3365,7 +3492,7 @@ export default function App() {
     StudioDB.getSettings().then((saved) => {
       setAppSettings(saved);
       setResolution(saved.defaultResolution || '720p');
-      setTargetDuration(saved.defaultDuration || 30);
+      setTargetDuration(saved.defaultDuration || 'context');
       setClipQuantity(saved.defaultQuantity || 5);
     });
     refreshHistoryAndStats();
@@ -3411,7 +3538,12 @@ export default function App() {
       if (!projectName.trim()) {
         setProjectName(meta.title);
       }
-      notify('YouTube video metadata verified.', 'success');
+      notify(
+        meta.durationSeconds
+          ? `YouTube verified (${formatDurationBadge(meta.durationSeconds)}).`
+          : 'YouTube video metadata verified.',
+        'success'
+      );
     } catch (err) {
       setYoutubeStatus('error');
       setYoutubeError(err.message || 'Failed to verify YouTube video.');
@@ -3523,6 +3655,8 @@ export default function App() {
     cancelJobRef.current = false;
     setActivePage('processing');
 
+    const detectedDuration = videoMeta?.duration || youtubeMeta?.durationSeconds || null;
+
     const snapshot =
       resumeFromStep > 1 && pipelineSnapshotRef.current
         ? pipelineSnapshotRef.current
@@ -3535,7 +3669,9 @@ export default function App() {
             sourceType: videoFile ? 'uploaded_video' : 'youtube_metadata',
             sourceUrl: youtubeMeta?.canonicalUrl || '',
             youtubeVideoId: youtubeMeta?.videoId || '',
-            sourceDuration: videoMeta?.duration || 180,
+            knownDuration: Boolean(detectedDuration && detectedDuration > 0),
+            sourceDuration: detectedDuration || 1800,
+            directVideoPayload: null,
             keyframes: [],
             extractedBriefRules: briefRules,
             rankedClips: [],
@@ -3612,12 +3748,24 @@ export default function App() {
 
       // STEP 3 — Analyzing Video Content
       if (resumeFromStep <= 3) {
-        updateProgress(3, 25, 'Extracting visual keyframes across video timeline...');
+        updateProgress(3, 25, 'Extracting timestamped frames & audio-visual context across video timeline...');
         if (videoFile) {
-          const frameCount = videoMeta.duration > 300 ? 18 : videoMeta.duration > 90 ? 14 : 10;
-          snapshot.keyframes = await extractTimelineKeyframes(videoFile, videoMeta.duration, frameCount);
+          // If uploaded video is <= 18MB, attach the actual video stream so Gemini hears real dialogue & sees every moment
+          if (videoFile.size <= 18 * 1024 * 1024) {
+            const base64Video = await fileToBase64(videoFile);
+            snapshot.directVideoPayload = {
+              base64: base64Video,
+              mimeType: videoFile.type || 'video/mp4'
+            };
+            snapshot.keyframes = [];
+          } else {
+            const frameCount = videoMeta.duration > 600 ? 36 : videoMeta.duration > 180 ? 28 : 20;
+            snapshot.keyframes = await extractTimelineKeyframes(videoFile, videoMeta.duration, frameCount);
+            snapshot.directVideoPayload = null;
+          }
         } else {
           snapshot.keyframes = [];
+          snapshot.directVideoPayload = null;
         }
         checkCancelled();
       }
@@ -3627,7 +3775,11 @@ export default function App() {
         updateProgress(4, 38, 'Analyzing scenes, storytelling arcs, and brief alignment with Gemini AI...');
         const combinedBrief = [briefFileMeta?.textContent || '', briefManualText.trim()].filter(Boolean).join('\n\n');
         const combinedContext = [
-          youtubeMeta ? `Verified YouTube Video: "${youtubeMeta.title}" by channel "${youtubeMeta.channelName}"` : '',
+          youtubeMeta
+            ? `Verified YouTube Video: "${youtubeMeta.title}" by channel "${youtubeMeta.channelName}"${
+                youtubeMeta.durationSeconds ? ` (Total duration: ${youtubeMeta.durationSeconds.toFixed(1)}s)` : ''
+              }`
+            : '',
           transcriptNotes.trim()
         ]
           .filter(Boolean)
@@ -3638,6 +3790,8 @@ export default function App() {
           model: appSettings.geminiModel,
           videoTitle: snapshot.sourceTitle,
           videoDuration: snapshot.sourceDuration,
+          knownDuration: snapshot.knownDuration,
+          directVideoPayload: snapshot.directVideoPayload,
           keyframes: snapshot.keyframes,
           briefRules: snapshot.extractedBriefRules,
           rawBriefText: combinedBrief,
@@ -3663,7 +3817,8 @@ export default function App() {
           snapshot.rawMoments,
           snapshot.sourceDuration,
           targetDuration,
-          clipQuantity
+          clipQuantity,
+          snapshot.knownDuration
         );
 
         if (ranked.length === 0) {
@@ -3705,7 +3860,7 @@ export default function App() {
             7,
             basePct,
             videoFile
-              ? `Rendering Clip #${i + 1} of ${total} (${RESOLUTIONS[resolution].tag} Atmospheric Cinematic)...`
+              ? `Rendering Clip #${i + 1} of ${total} (${RESOLUTIONS[resolution].tag} MP4)...`
               : `Preparing Clip #${i + 1} of ${total} timeline package...`,
             { clipsCompleted: i, clipsTotal: total }
           );
@@ -3810,6 +3965,21 @@ export default function App() {
         statusText: `Failed at Step ${prev.currentStep}`
       }));
       notify(err.message || 'Processing interrupted.', 'error');
+    }
+  };
+
+  const handleOpenHistoryProject = async (projectId) => {
+    try {
+      const loaded = await StudioDB.getProjectById(projectId);
+      if (!loaded) {
+        notify('Project could not be found in local database.', 'error');
+        return;
+      }
+      setActiveProject(loaded.project);
+      setActiveClips(loaded.clips);
+      setActivePage('results');
+    } catch {
+      notify('Failed to load project from history.', 'error');
     }
   };
 
@@ -4174,7 +4344,7 @@ export default function App() {
                       <div>
                         <h2 className="text-sm font-semibold text-white">Section B — Video Source</h2>
                         <p className="text-xs text-slate-400">
-                          Verify YouTube metadata (loads thumbnail preview) & upload an authorized video file for rendering.
+                          Verify YouTube metadata (loads thumbnail preview) & upload an authorized video file for MP4 rendering.
                         </p>
                       </div>
                     </div>
@@ -4234,13 +4404,17 @@ export default function App() {
                               </div>
                               <p className="text-sm font-semibold text-white truncate mt-0.5">{youtubeMeta.title}</p>
                               <p className="text-xs text-slate-400 mt-0.5">
-                                Channel: {youtubeMeta.channelName} • ID: <span className="font-mono">{youtubeMeta.videoId}</span>
+                                Channel: {youtubeMeta.channelName} • ID:{' '}
+                                <span className="font-mono">{youtubeMeta.videoId}</span>
+                                {youtubeMeta.durationSeconds
+                                  ? ` • Duration: ${formatDurationBadge(youtubeMeta.durationSeconds)}`
+                                  : ''}
                               </p>
                             </div>
                           </div>
 
                           <div className="p-2.5 rounded-lg bg-amber-950/25 border border-amber-500/25 text-[11px] text-amber-200/90 leading-relaxed">
-                            <strong>Terms of Service Notice:</strong> To respect YouTube copyright and platform restrictions, direct binary stream downloading is disabled. Upload your authorized local video file below to render downloadable 9:16 clips, or proceed to generate the AI viral moment & copy breakdown from verified metadata/transcript.
+                            <strong>Terms of Service Notice:</strong> To respect YouTube copyright and platform restrictions, direct binary stream downloading is disabled. Upload your authorized local video file below to render downloadable 9:16 MP4 clips, or proceed to generate the AI viral moment & copy breakdown from verified metadata/transcript.
                           </div>
                         </div>
                       )}
@@ -4249,7 +4423,7 @@ export default function App() {
                     <div className="pt-3 border-t border-slate-800/80 space-y-3">
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <span className="text-xs font-medium text-slate-300">
-                          Authorized Source Video File (Required for 9:16 Video Rendering)
+                          Authorized Source Video File (Required for 9:16 MP4 Rendering)
                         </span>
                         <button
                           type="button"
@@ -4540,12 +4714,12 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* D3. CLIP DURATION */}
+                    {/* D3. CLIP DURATION (INCLUDING SESUAIKAN KONTEKS KLIP) */}
                     <div className="space-y-2">
                       <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400">
                         D3. Target Clip Duration
                       </label>
-                      <div className="grid grid-cols-2 gap-2.5">
+                      <div className="grid grid-cols-1 gap-2.5">
                         {DURATIONS.map((dur) => {
                           const active = targetDuration === dur.value;
                           return (
@@ -4559,7 +4733,14 @@ export default function App() {
                                   : 'bg-[#0A0D12] border-slate-800 text-slate-400 hover:border-slate-700'
                               }`}
                             >
-                              <div className="text-sm font-bold">{dur.label}</div>
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-sm font-bold">{dur.label}</span>
+                                {dur.value === 'context' && (
+                                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-teal-500/20 text-teal-300 border border-teal-500/30">
+                                    AI Smart Boundary
+                                  </span>
+                                )}
+                              </div>
                               <div className="text-[11px] text-slate-400 mt-0.5 leading-snug">{dur.hint}</div>
                             </button>
                           );
@@ -4590,7 +4771,7 @@ export default function App() {
                         ))}
                       </select>
                       <p className="text-[11px] text-slate-500">
-                        AI prioritizes non-overlapping high-retention moments over filler duplicates.
+                        AI prioritizes non-overlapping high-retention moments across the full video timeline.
                       </p>
                     </div>
 
@@ -4614,9 +4795,15 @@ export default function App() {
                           </span>
                         </div>
                         <div className="flex items-center justify-between">
+                          <span className="text-slate-400">Duration Mode</span>
+                          <span className="font-mono text-teal-300">
+                            {targetDuration === 'context' ? 'Sesuai Konteks' : `${targetDuration}s`}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between">
                           <span className="text-slate-400">Output Format</span>
                           <span className="font-mono text-cyan-300">
-                            {RESOLUTIONS[resolution].tag} • {CLIPPING_STYLES[clippingStyle].name}
+                            {RESOLUTIONS[resolution].tag} • MP4
                           </span>
                         </div>
                       </div>
@@ -5017,7 +5204,10 @@ export default function App() {
 
                           <div className="absolute bottom-2.5 left-3 right-3 flex items-center justify-between text-xs">
                             <span className="font-mono text-slate-300">
-                              {proj.settings?.resolution || '720p'} • {proj.settings?.targetDuration || 30}s
+                              {proj.settings?.resolution || '720p'} •{' '}
+                              {proj.settings?.targetDuration === 'context'
+                                ? 'Sesuai Konteks'
+                                : `${proj.settings?.targetDuration || 30}s`}
                             </span>
                             <span className="font-mono font-bold text-cyan-400">Top: {proj.topScore || 0}/100</span>
                           </div>
@@ -5123,10 +5313,14 @@ export default function App() {
                     <select
                       value={appSettings.defaultDuration}
                       onChange={(e) =>
-                        setAppSettings({ ...appSettings, defaultDuration: Number(e.target.value) })
+                        setAppSettings({
+                          ...appSettings,
+                          defaultDuration: e.target.value === 'context' ? 'context' : Number(e.target.value)
+                        })
                       }
                       className="w-full rounded-lg bg-[#0A0D12] border border-slate-800 px-3 py-2 text-sm text-white"
                     >
+                      <option value="context">Sesuaikan Konteks Klip (15–90d)</option>
                       <option value={30}>30 seconds</option>
                       <option value={60}>60 seconds</option>
                     </select>
@@ -5161,8 +5355,8 @@ export default function App() {
                       }
                       className="w-full rounded-lg bg-[#0A0D12] border border-slate-800 px-3 py-2 text-sm text-white"
                     >
-                      <option value="fast">Balanced (1.5x Realtime)</option>
-                      <option value="realtime">Studio Master (1x Realtime)</option>
+                      <option value="realtime">Studio Master (1x Realtime Smooth)</option>
+                      <option value="fast">Balanced (1.25x Realtime)</option>
                     </select>
                   </div>
                 </div>
