@@ -810,12 +810,24 @@ async function fetchGeminiWithBackoff(apiKey, model, payload, maxRetries = 3, ti
 }
 
 const GeminiService = {
+  getThinkingConfig(model, budget) {
+    const m = (model || '').toLowerCase();
+    if (m.includes('gemini-3') || m.includes('gemini-2.5')) {
+      return { thinkingConfig: { thinkingBudget: budget } };
+    }
+    return {};
+  },
+
   async validateApiKey(apiKey, model = DEFAULT_GEMINI_MODEL) {
     const payload = {
       contents: [{ parts: [{ text: 'Respond with OK.' }] }],
-      generationConfig: { maxOutputTokens: 8, temperature: 0 }
+      generationConfig: {
+        maxOutputTokens: 8,
+        temperature: 0,
+        ...this.getThinkingConfig(model, 0)
+      }
     };
-    await fetchGeminiWithBackoff(apiKey, model, payload, 1, 15000);
+    await fetchGeminiWithBackoff(apiKey, model, payload, 1, 20000);
     return true;
   },
 
@@ -849,6 +861,7 @@ ${briefText || '(See attached PDF document)'}`
       generationConfig: {
         responseMimeType: 'application/json',
         temperature: 0.2,
+        ...this.getThinkingConfig(model, 512),
         responseSchema: {
           type: 'OBJECT',
           properties: {
@@ -878,7 +891,7 @@ ${briefText || '(See attached PDF document)'}`
       }
     };
 
-    const raw = await fetchGeminiWithBackoff(apiKey, model, payload, 2, 30000);
+    const raw = await fetchGeminiWithBackoff(apiKey, model, payload, 2, 90000);
     return JSON.parse(raw);
   },
 
@@ -993,6 +1006,7 @@ MANDATORY OUTPUT RULES FOR EVERY CLIP:
       generationConfig: {
         responseMimeType: 'application/json',
         temperature: 0.4,
+        ...this.getThinkingConfig(model, 2048),
         responseSchema: {
           type: 'OBJECT',
           properties: {
@@ -1089,7 +1103,7 @@ MANDATORY OUTPUT RULES FOR EVERY CLIP:
       }
     };
 
-    const raw = await fetchGeminiWithBackoff(apiKey, model, payload, 2, 75000);
+    const raw = await fetchGeminiWithBackoff(apiKey, model, payload, 2, 150000);
     return JSON.parse(raw);
   },
 
@@ -1168,11 +1182,12 @@ Avoid repeating previous options.`
       generationConfig: {
         responseMimeType: 'application/json',
         temperature: 0.7,
+        ...this.getThinkingConfig(model, 512),
         responseSchema: schemaByField[fieldType]
       }
     };
 
-    const raw = await fetchGeminiWithBackoff(apiKey, model, payload, 2, 25000);
+    const raw = await fetchGeminiWithBackoff(apiKey, model, payload, 2, 45000);
     const parsed = JSON.parse(raw);
     return parsed.items || [];
   }
@@ -1398,10 +1413,10 @@ async function extractTimelineKeyframes(file, duration, desiredFrameCount = 24) 
 
   const count = Math.min(desiredFrameCount, Math.max(6, Math.floor(duration / 2)));
   const canvas = document.createElement('canvas');
-  const scaleW = 512;
+  const scaleW = 448;
   const scaleH = Math.round((scaleW * (video.videoHeight || 720)) / (video.videoWidth || 1280));
   canvas.width = scaleW;
-  canvas.height = Math.max(220, scaleH);
+  canvas.height = Math.max(200, scaleH);
   const ctx = canvas.getContext('2d');
 
   const keyframes = [];
@@ -1429,7 +1444,7 @@ async function extractTimelineKeyframes(file, duration, desiredFrameCount = 24) 
     ctx.font = 'bold 13px monospace';
     ctx.fillText(`TIME ${formatTimecode(targetTime)}`, 14, 24);
 
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.78);
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.72);
     keyframes.push({
       time: targetTime,
       base64: dataUrl.split(',')[1]
@@ -1441,9 +1456,283 @@ async function extractTimelineKeyframes(file, duration, desiredFrameCount = 24) 
   return keyframes;
 }
 
+// Creates or resizes an isolated offscreen canvas for fast background blur without cross-tainting
+function prepareIsolatedBlurCanvas(w, h, targetCanvas = null) {
+  if (typeof document === 'undefined') return null;
+  const c = targetCanvas || document.createElement('canvas');
+  if (c.width !== w || c.height !== h) {
+    c.width = w;
+    c.height = h;
+  }
+  return c;
+}
+
+/**
+ * Patches MP4 (moov/mvhd/tkhd/mdhd/mehd) and WebM (EBML Info Duration) container metadata
+ * so mobile galleries and video players display the true clip duration instead of 00:01
+ * and seek smoothly without frame drops.
+ */
+function readFourCC(view, offset) {
+  return String.fromCharCode(
+    view.getUint8(offset),
+    view.getUint8(offset + 1),
+    view.getUint8(offset + 2),
+    view.getUint8(offset + 3)
+  );
+}
+
+function patchMp4DurationBuffer(arrayBuffer, durationMs) {
+  const view = new DataView(arrayBuffer);
+  const len = arrayBuffer.byteLength;
+  let movieTimescale = 1000;
+
+  let offset = 0;
+  while (offset + 8 <= len) {
+    let boxSize = view.getUint32(offset);
+    const boxType = readFourCC(view, offset + 4);
+    let headerSize = 8;
+
+    if (boxSize === 1 && offset + 16 <= len) {
+      boxSize = Number(view.getBigUint64(offset + 8));
+      headerSize = 16;
+    } else if (boxSize === 0) {
+      boxSize = len - offset;
+    }
+    if (boxSize < headerSize || offset + boxSize > len) break;
+
+    if (boxType === 'moov') {
+      const moovEnd = offset + boxSize;
+      // Pass 1: find mvhd timescale
+      let scan = offset + headerSize;
+      while (scan + 8 <= moovEnd) {
+        const cSize = view.getUint32(scan);
+        const cType = readFourCC(view, scan + 4);
+        if (cSize < 8 || scan + cSize > moovEnd) break;
+        if (cType === 'mvhd') {
+          const ver = view.getUint8(scan + 8);
+          if (ver === 0 && scan + 24 <= moovEnd) {
+            movieTimescale = view.getUint32(scan + 20) || 1000;
+          } else if (ver === 1 && scan + 36 <= moovEnd) {
+            movieTimescale = view.getUint32(scan + 28) || 1000;
+          }
+        }
+        scan += cSize;
+      }
+
+      // Pass 2: patch mvhd, mvex/mehd, and trak (tkhd + mdia/mdhd)
+      let child = offset + headerSize;
+      while (child + 8 <= moovEnd) {
+        const cSize = view.getUint32(child);
+        const cType = readFourCC(view, child + 4);
+        if (cSize < 8 || child + cSize > moovEnd) break;
+        const cEnd = child + cSize;
+
+        if (cType === 'mvhd') {
+          const ver = view.getUint8(child + 8);
+          const scaled = Math.max(1, Math.round((durationMs / 1000) * movieTimescale));
+          if (ver === 0 && child + 28 <= cEnd) {
+            view.setUint32(child + 24, scaled);
+          } else if (ver === 1 && child + 44 <= cEnd) {
+            view.setBigUint64(child + 32, BigInt(scaled));
+          }
+        } else if (cType === 'mvex') {
+          let grand = child + 8;
+          while (grand + 8 <= cEnd) {
+            const gSize = view.getUint32(grand);
+            const gType = readFourCC(view, grand + 4);
+            if (gSize < 8 || grand + gSize > cEnd) break;
+            if (gType === 'mehd') {
+              const ver = view.getUint8(grand + 8);
+              const scaled = Math.max(1, Math.round((durationMs / 1000) * movieTimescale));
+              if (ver === 0 && grand + 16 <= grand + gSize) {
+                view.setUint32(grand + 12, scaled);
+              } else if (ver === 1 && grand + 20 <= grand + gSize) {
+                view.setBigUint64(grand + 12, BigInt(scaled));
+              }
+            }
+            grand += gSize;
+          }
+        } else if (cType === 'trak') {
+          let grand = child + 8;
+          while (grand + 8 <= cEnd) {
+            const gSize = view.getUint32(grand);
+            const gType = readFourCC(view, grand + 4);
+            if (gSize < 8 || grand + gSize > cEnd) break;
+            const gEnd = grand + gSize;
+
+            if (gType === 'tkhd') {
+              const ver = view.getUint8(grand + 8);
+              const scaled = Math.max(1, Math.round((durationMs / 1000) * movieTimescale));
+              if (ver === 0 && grand + 32 <= gEnd) {
+                view.setUint32(grand + 28, scaled);
+              } else if (ver === 1 && grand + 48 <= gEnd) {
+                view.setBigUint64(grand + 36, BigInt(scaled));
+              }
+            } else if (gType === 'mdia') {
+              let great = grand + 8;
+              while (great + 8 <= gEnd) {
+                const mSize = view.getUint32(great);
+                const mType = readFourCC(view, great + 4);
+                if (mSize < 8 || great + mSize > gEnd) break;
+                if (mType === 'mdhd') {
+                  const ver = view.getUint8(great + 8);
+                  if (ver === 0 && great + 28 <= great + mSize) {
+                    const mediaTs = view.getUint32(great + 20) || 1000;
+                    const scaled = Math.max(1, Math.round((durationMs / 1000) * mediaTs));
+                    view.setUint32(great + 24, scaled);
+                  } else if (ver === 1 && great + 44 <= great + mSize) {
+                    const mediaTs = view.getUint32(great + 28) || 1000;
+                    const scaled = Math.max(1, Math.round((durationMs / 1000) * mediaTs));
+                    view.setBigUint64(great + 32, BigInt(scaled));
+                  }
+                }
+                great += mSize;
+              }
+            }
+            grand += gSize;
+          }
+        }
+        child += cSize;
+      }
+      break;
+    }
+
+    offset += boxSize;
+  }
+  return arrayBuffer;
+}
+
+function readEbmlVint(bytes, pos, isElementId = false) {
+  if (pos >= bytes.length) return null;
+  const first = bytes[pos];
+  if (first === 0) return null;
+  let length = 1;
+  let mask = 0x80;
+  while (length <= 8 && (first & mask) === 0) {
+    mask >>= 1;
+    length++;
+  }
+  if (length > 8 || pos + length > bytes.length) return null;
+  let value = isElementId ? first : first & (mask - 1);
+  for (let i = 1; i < length; i++) {
+    value = value * 256 + bytes[pos + i];
+  }
+  const allOnes = !isElementId && value === Math.pow(2, 7 * length) - 1;
+  return { value, length, unknown: allOnes };
+}
+
+function writeEbmlVintSize(bytes, pos, length, newValue) {
+  let v = Math.floor(newValue);
+  for (let i = length - 1; i >= 1; i--) {
+    bytes[pos + i] = v & 0xff;
+    v = Math.floor(v / 256);
+  }
+  const marker = 1 << (8 - length);
+  bytes[pos] = marker | (v & (marker - 1));
+}
+
+function patchWebmDurationBuffer(arrayBuffer, durationMs) {
+  const bytes = new Uint8Array(arrayBuffer);
+  const scanLimit = Math.min(bytes.length, 65536);
+  let pos = 0;
+
+  // Skip EBML Header (0x1A45DFA3)
+  const hdrId = readEbmlVint(bytes, pos, true);
+  if (!hdrId || hdrId.value !== 0x1a45dfa3) return arrayBuffer;
+  const hdrSize = readEbmlVint(bytes, pos + hdrId.length, false);
+  if (!hdrSize) return arrayBuffer;
+  pos += hdrId.length + hdrSize.length + hdrSize.value;
+
+  // Segment (0x18538067)
+  const segId = readEbmlVint(bytes, pos, true);
+  if (!segId || segId.value !== 0x18538067) return arrayBuffer;
+  const segSizePos = pos + segId.length;
+  const segSize = readEbmlVint(bytes, segSizePos, false);
+  if (!segSize) return arrayBuffer;
+  pos = segSizePos + segSize.length;
+
+  while (pos < scanLimit) {
+    const elId = readEbmlVint(bytes, pos, true);
+    if (!elId) break;
+    const elSizePos = pos + elId.length;
+    const elSize = readEbmlVint(bytes, elSizePos, false);
+    if (!elSize || elSize.unknown) break;
+    const dataPos = elSizePos + elSize.length;
+    const nextPos = dataPos + elSize.value;
+
+    if (elId.value === 0x1549a966 && nextPos <= bytes.length) {
+      let timecodeScale = 1000000;
+      let durationFieldOffset = -1;
+      let durationFieldLen = 0;
+      let sub = dataPos;
+
+      while (sub < nextPos) {
+        const sId = readEbmlVint(bytes, sub, true);
+        if (!sId) break;
+        const sSize = readEbmlVint(bytes, sub + sId.length, false);
+        if (!sSize) break;
+        const sData = sub + sId.length + sSize.length;
+        if (sId.value === 0x2ad7b1 && sData + sSize.value <= nextPos) {
+          let ts = 0;
+          for (let i = 0; i < sSize.value; i++) ts = ts * 256 + bytes[sData + i];
+          if (ts > 0) timecodeScale = ts;
+        } else if (sId.value === 0x4489) {
+          durationFieldOffset = sData;
+          durationFieldLen = sSize.value;
+        }
+        sub = sData + sSize.value;
+      }
+
+      const scaledDuration = durationMs * (1000000 / timecodeScale);
+      if (durationFieldOffset !== -1 && (durationFieldLen === 4 || durationFieldLen === 8)) {
+        const dv = new DataView(arrayBuffer);
+        if (durationFieldLen === 8) dv.setFloat64(durationFieldOffset, scaledDuration);
+        else dv.setFloat32(durationFieldOffset, scaledDuration);
+        return arrayBuffer;
+      }
+
+      // Insert 11-byte Duration element (0x4489, size 0x88, float64) into Info
+      const insertLen = 11;
+      const out = new Uint8Array(bytes.length + insertLen);
+      out.set(bytes.subarray(0, nextPos), 0);
+      out[nextPos] = 0x44;
+      out[nextPos + 1] = 0x89;
+      out[nextPos + 2] = 0x88;
+      new DataView(out.buffer).setFloat64(nextPos + 3, scaledDuration);
+      out.set(bytes.subarray(nextPos), nextPos + insertLen);
+
+      writeEbmlVintSize(out, elSizePos, elSize.length, elSize.value + insertLen);
+      if (!segSize.unknown) {
+        writeEbmlVintSize(out, segSizePos, segSize.length, segSize.value + insertLen);
+      }
+      return out.buffer;
+    }
+
+    pos = nextPos;
+  }
+  return arrayBuffer;
+}
+
+async function patchVideoContainerDuration(blob, durationMs) {
+  try {
+    if (!blob || blob.size < 32 || !Number.isFinite(durationMs) || durationMs <= 0) {
+      return blob;
+    }
+    const buf = await blob.arrayBuffer();
+    const mime = (blob.type || '').toLowerCase();
+    const patchedBuf = mime.includes('webm')
+      ? patchWebmDurationBuffer(buf, durationMs)
+      : patchMp4DurationBuffer(buf, durationMs);
+    return new Blob([patchedBuf], { type: blob.type || 'video/mp4' });
+  } catch {
+    return blob;
+  }
+}
+
 /**
  * Draws a single frame in the 9:16 composition:
- * - Full-bleed blurred background across the entire 9:16 canvas (adjustable via Efek Blur 0%..200%)
+ * - Full-bleed blurred background rendered via a fast low-res offscreen buffer so mobile
+ *   devices sustain a locked 30fps with zero frame drop.
  * - Unblurred foreground OVERLAY whose actual bounding box (overlayW × overlayH)
  *   grows larger or shrinks with Zoom (30%..320%) and moves with Sumbu X / Sumbu Y.
  */
@@ -1455,7 +1744,7 @@ function drawAtmosphericCinematicFrame(
   transform = DEFAULT_EDIT_TRANSFORM,
   options = {}
 ) {
-  const { showOverlayGuide = false } = options;
+  const { showOverlayGuide = false, blurCanvas: customBlurCanvas = null } = options;
 
   const vw =
     mediaSource?.videoWidth ||
@@ -1480,24 +1769,36 @@ function drawAtmosphericCinematicFrame(
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
 
-  // 1. Background layer: enlarged cover scale with adjustable atmospheric blur across full 9:16 canvas
-  ctx.save();
-  const coverScale = Math.max(W / vw, H / vh) * 1.24;
-  const bgW = vw * coverScale;
-  const bgH = vh * coverScale;
-  const bgX = (W - bgW) / 2;
-  const bgY = (H - bgH) / 2;
-
+  // 1. Background layer: fast offscreen blurred buffer upscaled smoothly to full 9:16 canvas
   ctx.fillStyle = '#07222b';
   ctx.fillRect(0, 0, W, H);
+
   if (mediaSource) {
-    ctx.filter =
-      blurPx > 0
-        ? `blur(${blurPx}px) saturate(1.12) brightness(0.94)`
-        : 'saturate(1.08) brightness(0.94)';
-    ctx.drawImage(mediaSource, bgX, bgY, bgW, bgH);
+    const bw = 180;
+    const bh = Math.max(320, Math.round((bw * H) / W));
+    const blurCanvas = prepareIsolatedBlurCanvas(bw, bh, customBlurCanvas);
+    if (blurCanvas) {
+      const bCtx = blurCanvas.getContext('2d');
+      const coverScale = Math.max(bw / vw, bh / vh) * 1.24;
+      const bgW = vw * coverScale;
+      const bgH = vh * coverScale;
+      const bgX = (bw - bgW) / 2;
+      const bgY = (bh - bgH) / 2;
+      const scaledBlur = Math.max(0, Math.round(blurPx * (bw / W)));
+
+      bCtx.save();
+      bCtx.fillStyle = '#07222b';
+      bCtx.fillRect(0, 0, bw, bh);
+      bCtx.filter =
+        scaledBlur > 0
+          ? `blur(${scaledBlur}px) saturate(1.12) brightness(0.94)`
+          : 'saturate(1.08) brightness(0.94)';
+      bCtx.drawImage(mediaSource, bgX, bgY, bgW, bgH);
+      bCtx.restore();
+
+      ctx.drawImage(blurCanvas, 0, 0, W, H);
+    }
   }
-  ctx.restore();
 
   // 2. Calculate base overlay box at 100% zoom, then scale BOTH width & height by zoomFactor
   let baseW, baseH;
@@ -1615,10 +1916,26 @@ async function renderAtmosphericCinematicClip({
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
 
-  drawAtmosphericCinematicFrame(ctx, video, W, H, transform, { showOverlayGuide: false });
-  const thumbnailDataUrl = canvas.toDataURL('image/jpeg', 0.92);
+  // Dedicated untainted blur buffer strictly scoped to this video export
+  const renderBlurCanvas = document.createElement('canvas');
 
-  const canvasStream = canvas.captureStream(30);
+  drawAtmosphericCinematicFrame(ctx, video, W, H, transform, {
+    showOverlayGuide: false,
+    blurCanvas: renderBlurCanvas
+  });
+  let thumbnailDataUrl = '';
+  try {
+    thumbnailDataUrl = canvas.toDataURL('image/jpeg', 0.92);
+  } catch {
+    thumbnailDataUrl = '';
+  }
+
+  const TARGET_FPS = 30;
+  const FRAME_INTERVAL_MS = 1000 / TARGET_FPS;
+  const supportsManualFrame = typeof HTMLCanvasElement !== 'undefined';
+  const canvasStream = supportsManualFrame ? canvas.captureStream(0) : canvas.captureStream(TARGET_FPS);
+  const canvasVideoTrack = canvasStream.getVideoTracks()[0] || null;
+
   let combinedStream = canvasStream;
   let audioCtx = null;
 
@@ -1660,7 +1977,7 @@ async function renderAtmosphericCinematicClip({
   const recorder = supportedMime
     ? new MediaRecorder(combinedStream, {
         mimeType: supportedMime,
-        videoBitsPerSecond: resolutionKey === '1080p' ? 14000000 : 8000000
+        videoBitsPerSecond: resolutionKey === '1080p' ? 12000000 : 7500000
       })
     : new MediaRecorder(combinedStream);
 
@@ -1669,20 +1986,16 @@ async function renderAtmosphericCinematicClip({
   };
 
   const clipSpan = Math.max(1, safeEnd - safeStart);
-  video.playbackRate = speedMode === 'fast' ? 1.25 : 1.0;
+  // Keep 1.0x playbackRate during encoding so decoder & 30fps clock stay locked with zero frame drop
+  video.playbackRate = 1.0;
 
   return new Promise((resolve, reject) => {
-    let rafId = null;
-    let vfcId = null;
+    let frameTimerId = null;
     let finished = false;
+    let lastRecordedTime = safeStart;
 
     const cleanup = () => {
-      if (rafId) cancelAnimationFrame(rafId);
-      if (vfcId && typeof video.cancelVideoFrameCallback === 'function') {
-        try {
-          video.cancelVideoFrameCallback(vfcId);
-        } catch {}
-      }
+      if (frameTimerId) clearInterval(frameTimerId);
       URL.revokeObjectURL(url);
       if (audioCtx) audioCtx.close().catch(() => {});
       video.remove();
@@ -1691,7 +2004,8 @@ async function renderAtmosphericCinematicClip({
     const finishRender = () => {
       if (finished) return;
       finished = true;
-      if (rafId) cancelAnimationFrame(rafId);
+      if (frameTimerId) clearInterval(frameTimerId);
+      lastRecordedTime = Math.min(safeEnd, Math.max(safeStart + 1, video.currentTime || safeEnd));
       video.pause();
       if (recorder.state !== 'inactive') {
         try {
@@ -1701,20 +2015,22 @@ async function renderAtmosphericCinematicClip({
       }
     };
 
-    recorder.onstop = () => {
+    recorder.onstop = async () => {
       const mime = recorder.mimeType || supportedMime || 'video/mp4';
-      const blob = new Blob(chunks, { type: mime });
+      const rawBlob = new Blob(chunks, { type: mime });
       cleanup();
-      if (!blob || blob.size === 0) {
+      if (!rawBlob || rawBlob.size === 0) {
         reject(
           new Error(
-            'Rendered video buffer was empty. Please try switching Render Encoding Speed to 1x Realtime in Settings.'
+            'Rendered video buffer was empty. Please try again with the browser tab kept active.'
           )
         );
         return;
       }
+      const actualDurationMs = Math.max(1000, Math.round((lastRecordedTime - safeStart) * 1000));
+      const patchedBlob = await patchVideoContainerDuration(rawBlob, actualDurationMs);
       resolve({
-        blob,
+        blob: patchedBlob,
         thumbnailDataUrl,
         mimeType: mime,
         width: W,
@@ -1728,28 +2044,36 @@ async function renderAtmosphericCinematicClip({
       reject(new Error(err?.error?.message || 'Video encoding error during clip render.'));
     };
 
-    const pumpFrame = () => {
+    const renderSteadyFrame = () => {
       if (finished) return;
-      drawAtmosphericCinematicFrame(ctx, video, W, H, transform, { showOverlayGuide: false });
-      const pct = Math.min(100, Math.max(0, ((video.currentTime - safeStart) / clipSpan) * 100));
+      if (video.readyState >= 2) {
+        drawAtmosphericCinematicFrame(ctx, video, W, H, transform, {
+          showOverlayGuide: false,
+          blurCanvas: renderBlurCanvas
+        });
+        if (canvasVideoTrack && typeof canvasVideoTrack.requestFrame === 'function') {
+          try {
+            canvasVideoTrack.requestFrame();
+          } catch {}
+        }
+      }
+
+      const cur = video.currentTime;
+      if (cur > lastRecordedTime) lastRecordedTime = cur;
+      const pct = Math.min(100, Math.max(0, ((cur - safeStart) / clipSpan) * 100));
       if (onFrameProgress) onFrameProgress(pct);
 
-      if (video.currentTime >= safeEnd || video.ended) {
+      if (cur >= safeEnd || video.ended) {
         finishRender();
-        return;
-      }
-      if (typeof video.requestVideoFrameCallback === 'function') {
-        vfcId = video.requestVideoFrameCallback(pumpFrame);
-      } else {
-        rafId = requestAnimationFrame(pumpFrame);
       }
     };
 
-    recorder.start(250);
+    recorder.start(500);
     video
       .play()
       .then(() => {
-        pumpFrame();
+        renderSteadyFrame();
+        frameTimerId = setInterval(renderSteadyFrame, FRAME_INTERVAL_MS);
       })
       .catch((err) => {
         finished = true;
@@ -2098,6 +2422,7 @@ function PrecisionTickSlider({ label, value, min, max, step = 1, unit = '%', onC
  */
 function LiveStylePreviewEditor({ youtubeMeta, transform, onChangeTransform }) {
   const previewCanvasRef = useRef(null);
+  const previewBlurCanvasRef = useRef(null);
   const ytThumbImgRef = useRef(null);
   const [ytThumbReady, setYtThumbReady] = useState(false);
 
@@ -2145,10 +2470,14 @@ function LiveStylePreviewEditor({ youtubeMeta, transform, onChangeTransform }) {
   useEffect(() => {
     const canvas = previewCanvasRef.current;
     if (!canvas) return;
+    if (!previewBlurCanvasRef.current) {
+      previewBlurCanvasRef.current = document.createElement('canvas');
+    }
     const ctx = canvas.getContext('2d');
     const sourceImg = ytThumbReady ? ytThumbImgRef.current : null;
     drawAtmosphericCinematicFrame(ctx, sourceImg, canvas.width, canvas.height, transform, {
-      showOverlayGuide: Boolean(sourceImg)
+      showOverlayGuide: Boolean(sourceImg),
+      blurCanvas: previewBlurCanvasRef.current
     });
   }, [ytThumbReady, transform]);
 
@@ -2558,8 +2887,9 @@ function ClipResultCard({
                   src={videoUrl}
                   poster={clip.thumbnailDataUrl || undefined}
                   playsInline
+                  webkit-playsinline="true"
                   controls
-                  preload="auto"
+                  preload="metadata"
                   className="w-full h-full object-contain bg-black"
                 />
               ) : playYouTubeSegment && youtubeVideoId ? (
@@ -2789,7 +3119,8 @@ function ClipResultCard({
                     controls
                     autoPlay
                     playsInline
-                    loop
+                    webkit-playsinline="true"
+                    preload="auto"
                     className="w-full h-full object-contain"
                   />
                 </div>
@@ -3750,8 +4081,8 @@ export default function App() {
       if (resumeFromStep <= 3) {
         updateProgress(3, 25, 'Extracting timestamped frames & audio-visual context across video timeline...');
         if (videoFile) {
-          // If uploaded video is <= 18MB, attach the actual video stream so Gemini hears real dialogue & sees every moment
-          if (videoFile.size <= 18 * 1024 * 1024) {
+          // Attach full inline video for compact files (<= 6MB); use fast timestamped keyframes for larger files over mobile networks
+          if (videoFile.size <= 6 * 1024 * 1024) {
             const base64Video = await fileToBase64(videoFile);
             snapshot.directVideoPayload = {
               base64: base64Video,
@@ -3759,7 +4090,7 @@ export default function App() {
             };
             snapshot.keyframes = [];
           } else {
-            const frameCount = videoMeta.duration > 600 ? 36 : videoMeta.duration > 180 ? 28 : 20;
+            const frameCount = videoMeta.duration > 600 ? 32 : videoMeta.duration > 180 ? 24 : 18;
             snapshot.keyframes = await extractTimelineKeyframes(videoFile, videoMeta.duration, frameCount);
             snapshot.directVideoPayload = null;
           }
