@@ -755,57 +755,90 @@ async function fetchGeminiWithBackoff(apiKey, model, payload, maxRetries = 3, ti
   if (!apiKey || !apiKey.trim()) {
     throw new Error('Gemini API key is required.');
   }
-  const cleanModel = (model || DEFAULT_GEMINI_MODEL).trim();
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(cleanModel)}:generateContent?key=${encodeURIComponent(apiKey.trim())}`;
+  const primaryModel = (model || DEFAULT_GEMINI_MODEL).trim();
+  const modelsToTry =
+    primaryModel !== 'gemini-2.5-flash' ? [primaryModel, 'gemini-2.5-flash'] : [primaryModel];
 
   let lastError = null;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal: controller.signal
-      });
-      clearTimeout(timer);
 
-      if (!response.ok) {
-        const errBody = await response.json().catch(() => ({}));
-        const status = response.status;
-        if (status === 400 || status === 401 || status === 403) {
-          const msg = errBody?.error?.message || 'Invalid or unauthorized Gemini API key.';
-          throw new Error(msg.replace(/key=[^&\s]+/gi, 'key=[REDACTED]'));
+  for (const currentModel of modelsToTry) {
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(currentModel)}:generateContent?key=${encodeURIComponent(apiKey.trim())}`;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: controller.signal
+        });
+        clearTimeout(timer);
+
+        if (!response.ok) {
+          const errBody = await response.json().catch(() => ({}));
+          const status = response.status;
+          const rawApiMsg = (errBody?.error?.message || '').replace(/key=[^&\s]+/gi, 'key=[REDACTED]');
+
+          if (status === 400 || status === 401 || status === 403) {
+            const authErr = new Error(rawApiMsg || 'Invalid or unauthorized Gemini API key.');
+            authErr.isAuthError = true;
+            throw authErr;
+          }
+
+          if (status === 429) {
+            if (attempt < maxRetries) {
+              const delay = Math.pow(2, attempt) * 2200;
+              await new Promise((r) => setTimeout(r, delay));
+              continue;
+            }
+            const rateErr = new Error(
+              `Kuota / Rate Limit Gemini API tercapai (HTTP 429). API key kamu valid, tunggu 30–60 detik lalu coba lagi.${rawApiMsg ? ` Detail: ${rawApiMsg}` : ''}`
+            );
+            rateErr.isRateLimit = true;
+            throw rateErr;
+          }
+
+          if (status >= 500 && attempt < maxRetries) {
+            const delay = Math.pow(2, attempt) * 1500;
+            await new Promise((r) => setTimeout(r, delay));
+            continue;
+          }
+
+          throw new Error(rawApiMsg || `Gemini API request failed (HTTP ${status}).`);
         }
-        if ((status === 429 || status >= 500) && attempt < maxRetries) {
-          const delay = Math.pow(2, attempt) * 1400;
-          await new Promise((r) => setTimeout(r, delay));
+
+        const json = await response.json();
+        const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!text) {
+          throw new Error('Gemini API returned an empty or blocked response.');
+        }
+        return text;
+      } catch (err) {
+        clearTimeout(timer);
+        if (err.isAuthError) {
+          throw err;
+        }
+        if (err.name === 'AbortError') {
+          lastError = new Error('AI request timed out. Please retry.');
+        } else {
+          lastError = err;
+        }
+        if (attempt < maxRetries && !err.isRateLimit) {
+          await new Promise((r) => setTimeout(r, Math.pow(2, attempt) * 1500));
           continue;
         }
-        throw new Error(`Gemini API request failed (HTTP ${status}).`);
+        break;
       }
+    }
 
-      const json = await response.json();
-      const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!text) {
-        throw new Error('Gemini API returned an empty or blocked response.');
-      }
-      return text;
-    } catch (err) {
-      clearTimeout(timer);
-      if (err.name === 'AbortError') {
-        lastError = new Error('AI request timed out. Please retry.');
-      } else {
-        lastError = new Error((err.message || 'AI connection error').replace(/key=[^&\s]+/gi, 'key=[REDACTED]'));
-      }
-      if (attempt < maxRetries && !lastError.message.toLowerCase().includes('api key')) {
-        await new Promise((r) => setTimeout(r, Math.pow(2, attempt) * 1400));
-        continue;
-      }
-      throw lastError;
+    // Only try fallback model if the primary model hit a 429 quota/rate limit
+    if (!lastError?.isRateLimit) {
+      break;
     }
   }
+
   throw lastError || new Error('Gemini API request failed.');
 }
 
@@ -816,6 +849,91 @@ const GeminiService = {
       return { thinkingConfig: { thinkingBudget: budget } };
     }
     return {};
+  },
+
+  async validateApiKey(apiKey, model = DEFAULT_GEMINI_MODEL) {
+    const trimmedKey = (apiKey || '').trim();
+    if (!trimmedKey) {
+      throw new Error('Gemini API key is required.');
+    }
+
+    // Step 1: Authenticate key directly via Models endpoint (uses 0 generateContent quota)
+    const modelsEndpoint = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(trimmedKey)}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    let availableModels = [];
+
+    try {
+      const res = await fetch(modelsEndpoint, { signal: controller.signal });
+      clearTimeout(timer);
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        const msg = (errBody?.error?.message || '').replace(/key=[^&\s]+/gi, 'key=[REDACTED]');
+        if (res.status === 400 || res.status === 401 || res.status === 403) {
+          throw new Error(msg || 'API key tidak valid atau tidak memiliki izin akses Gemini API.');
+        }
+        throw new Error(msg || `Gagal memverifikasi API key (HTTP ${res.status}).`);
+      }
+      const data = await res.json().catch(() => ({}));
+      availableModels = Array.isArray(data.models) ? data.models.map((m) => m.name || '') : [];
+    } catch (err) {
+      clearTimeout(timer);
+      if (err.name === 'AbortError') {
+        throw new Error('Koneksi ke server Google Gemini timeout. Periksa jaringan internet kamu.');
+      }
+      throw err;
+    }
+
+    // Step 2: Check generation readiness & auto-fallback if primary model hits 429 quota
+    const preferred = (model || DEFAULT_GEMINI_MODEL).trim();
+    const candidates = preferred !== 'gemini-2.5-flash' ? [preferred, 'gemini-2.5-flash'] : [preferred];
+
+    for (const candidate of candidates) {
+      try {
+        const payload = {
+          contents: [{ parts: [{ text: 'OK' }] }],
+          generationConfig: {
+            maxOutputTokens: 4,
+            temperature: 0,
+            ...this.getThinkingConfig(candidate, 0)
+          }
+        };
+        const ep = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(candidate)}:generateContent?key=${encodeURIComponent(trimmedKey)}`;
+        const testRes = await fetch(ep, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        if (testRes.ok) {
+          return {
+            valid: true,
+            activeModel: candidate,
+            switched: candidate !== preferred,
+            rateLimited: false
+          };
+        }
+        if (testRes.status === 400 || testRes.status === 401 || testRes.status === 403) {
+          const errBody = await testRes.json().catch(() => ({}));
+          const msg = (errBody?.error?.message || '').replace(/key=[^&\s]+/gi, 'key=[REDACTED]');
+          throw new Error(msg || 'API key tidak valid.');
+        }
+      } catch (err) {
+        if (err.message && err.message.toLowerCase().includes('api key')) {
+          throw err;
+        }
+      }
+    }
+
+    // Key is authenticated via /v1beta/models, but generateContent quota is temporarily rate-limited (429)
+    const fallbackFromList = availableModels.some((n) => n.includes('gemini-2.5-flash'))
+      ? 'gemini-2.5-flash'
+      : preferred;
+    return {
+      valid: true,
+      activeModel: fallbackFromList,
+      switched: false,
+      rateLimited: true
+    };
   },
 
   async validateApiKey(apiKey, model = DEFAULT_GEMINI_MODEL) {
@@ -3848,10 +3966,26 @@ export default function App() {
     setApiStatus('validating');
     setApiStatusMessage('Verifying connection with Google Gemini API...');
     try {
-      await GeminiService.validateApiKey(apiKey, appSettings.geminiModel);
+      const result = await GeminiService.validateApiKey(apiKey, appSettings.geminiModel);
+      const activeModel = result?.activeModel || appSettings.geminiModel;
+      if (result?.switched) {
+        const updatedSettings = { ...appSettings, geminiModel: activeModel };
+        setAppSettings(updatedSettings);
+        StudioDB.saveSettings(updatedSettings).catch(() => {});
+      }
       setApiStatus('valid');
-      setApiStatusMessage(`Connected (${appSettings.geminiModel})`);
-      notify('Gemini API key verified successfully.', 'success');
+      if (result?.rateLimited) {
+        setApiStatusMessage(
+          `API Key Valid (${activeModel}) — Kuota free-tier sedang penuh (HTTP 429). Tunggu 30–60 detik sebelum klik Generate.`
+        );
+        notify('API Key valid, namun kuota Gemini sedang penuh sementara (HTTP 429).', 'info');
+      } else if (result?.switched) {
+        setApiStatusMessage(`Connected (Auto-switched to ${activeModel})`);
+        notify(`Gemini API key verified! Otomatis menggunakan ${activeModel}.`, 'success');
+      } else {
+        setApiStatusMessage(`Connected (${activeModel})`);
+        notify('Gemini API key verified successfully.', 'success');
+      }
     } catch (err) {
       setApiStatus('invalid');
       setApiStatusMessage(err.message || 'Invalid Gemini API key.');
